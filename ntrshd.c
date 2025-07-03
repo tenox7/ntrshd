@@ -38,6 +38,10 @@ CRITICAL_SECTION logCriticalSection;
 HANDLE hConsole;
 WORD defaultConsoleColor;
 
+/* Global variables for tracking active processes */
+CRITICAL_SECTION processCountCriticalSection;
+int activeProcessCount = 0;
+
 /* Helper function to initialize server socket */
 SOCKET initializeServer() {
     WSADATA wsaData;
@@ -102,13 +106,15 @@ int main(int argc, char* argv[]) {
         defaultConsoleColor = CONSOLE_DEFAULT;
     }
     
-    /* Initialize critical section for thread-safe logging */
+    /* Initialize critical sections */
     InitializeCriticalSection(&logCriticalSection);
+    InitializeCriticalSection(&processCountCriticalSection);
     
     /* Initialize server */
     listenSocket = initializeServer();
     if (listenSocket == INVALID_SOCKET) {
         DeleteCriticalSection(&logCriticalSection);
+        DeleteCriticalSection(&processCountCriticalSection);
         return 1;
     }
     
@@ -151,6 +157,7 @@ int main(int argc, char* argv[]) {
     closesocket(listenSocket);
     WSACleanup();
     DeleteCriticalSection(&logCriticalSection);
+    DeleteCriticalSection(&processCountCriticalSection);
     
     return 0;
 }
@@ -233,13 +240,23 @@ DWORD WINAPI handleClient(LPVOID lpParam) {
     
     logMessage("Command: %s\n", command);
     
+    /* Increment active process count */
+    EnterCriticalSection(&processCountCriticalSection);
+    activeProcessCount++;
+    LeaveCriticalSection(&processCountCriticalSection);
+    
     /* Execute the command */
     executeCommand(command, clientSocket, remoteUser, clientHost);
+    
+    /* Decrement active process count */
+    EnterCriticalSection(&processCountCriticalSection);
+    activeProcessCount--;
+    LeaveCriticalSection(&processCountCriticalSection);
     
     /* Close connection */
     closesocket(clientSocket);
     
-    /* Reset to idle title */
+    /* Update title based on remaining processes */
     setIdleTitle();
     
     /* Free client data */
@@ -436,7 +453,15 @@ void setWindowTitle(const char* title) {
 
 /* Set idle window title */
 void setIdleTitle() {
-    setWindowTitle("NTRSHD [IDLE] Listening on Port 514");
+    EnterCriticalSection(&processCountCriticalSection);
+    if (activeProcessCount > 0) {
+        char titleBuffer[256];
+        sprintf(titleBuffer, "NTRSHD [%d RUNNING] Listening on Port 514", activeProcessCount);
+        setWindowTitle(titleBuffer);
+    } else {
+        setWindowTitle("NTRSHD [IDLE] Listening on Port 514");
+    }
+    LeaveCriticalSection(&processCountCriticalSection);
 }
 
 /* Set running window title with command truncation */
@@ -444,6 +469,12 @@ void setRunningTitle(const char* remoteUser, const char* clientHost, const char*
     char titleBuffer[256];
     char truncatedCommand[21];
     int commandLen;
+    int currentCount;
+    
+    /* Get current process count */
+    EnterCriticalSection(&processCountCriticalSection);
+    currentCount = activeProcessCount;
+    LeaveCriticalSection(&processCountCriticalSection);
     
     /* Truncate command to 20 characters */
     commandLen = strlen(command);
@@ -455,7 +486,7 @@ void setRunningTitle(const char* remoteUser, const char* clientHost, const char*
     }
     
     /* Format title */
-    sprintf(titleBuffer, "NTRSHD [RUNNING] %s@%s: %s", remoteUser, clientHost, truncatedCommand);
+    sprintf(titleBuffer, "NTRSHD [%d RUNNING] %s@%s: %s", currentCount, remoteUser, clientHost, truncatedCommand);
     setWindowTitle(titleBuffer);
 }
 
