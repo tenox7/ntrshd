@@ -238,7 +238,14 @@ DWORD WINAPI handleClient(LPVOID lpParam) {
         return 1;
     }
     
-    logMessage("Command: %s\n", command);
+    /* Log command with current directory */
+    {
+        char currentDir[256];
+        if (!GetCurrentDirectory(sizeof(currentDir), currentDir)) {
+            strcpy(currentDir, "Unknown");
+        }
+        logMessage("Command: %s [%s]\n", command, currentDir);
+    }
     
     /* Increment active process count */
     EnterCriticalSection(&processCountCriticalSection);
@@ -453,13 +460,21 @@ void setWindowTitle(const char* title) {
 
 /* Set idle window title */
 void setIdleTitle() {
+    char titleBuffer[512];
+    char currentDir[256];
+    
+    /* Get current working directory */
+    if (!GetCurrentDirectory(sizeof(currentDir), currentDir)) {
+        strcpy(currentDir, "Unknown");
+    }
+    
     EnterCriticalSection(&processCountCriticalSection);
     if (activeProcessCount > 0) {
-        char titleBuffer[256];
-        sprintf(titleBuffer, "NTRSHD [%d RUNNING] Listening on Port 514", activeProcessCount);
+        sprintf(titleBuffer, "NTRSHD [%d RUNNING] Listening on Port 514 [%s]", activeProcessCount, currentDir);
         setWindowTitle(titleBuffer);
     } else {
-        setWindowTitle("NTRSHD [IDLE] Listening on Port 514");
+        sprintf(titleBuffer, "NTRSHD [IDLE] Listening on Port 514 [%s]", currentDir);
+        setWindowTitle(titleBuffer);
     }
     LeaveCriticalSection(&processCountCriticalSection);
 }
