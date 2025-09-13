@@ -436,6 +436,25 @@ StartShell(
     PROCESS_INFORMATION ProcessInformation;
     STARTUPINFO si;
     HANDLE ProcessHandle = NULL;
+    char *cmdLine;
+    int cmdLineLen;
+
+    /* Build command line - check if already using cmd */
+    if (strncmp(pr00gie, "cmd", 3) == 0 || strncmp(pr00gie, "CMD", 3) == 0) {
+        cmdLineLen = strlen(pr00gie) + 1;
+        cmdLine = (char*)malloc(cmdLineLen);
+        if (!cmdLine) {
+            return NULL;
+        }
+        strcpy(cmdLine, pr00gie);
+    } else {
+        cmdLineLen = strlen(pr00gie) + 20;
+        cmdLine = (char*)malloc(cmdLineLen);
+        if (!cmdLine) {
+            return NULL;
+        }
+        sprintf(cmdLine, "cmd.exe /c %s", pr00gie);
+    }
 
     //
     // Initialize process startup info
@@ -460,17 +479,17 @@ StartShell(
       	              GetCurrentProcess(), &si.hStdError,
         	            DUPLICATE_SAME_ACCESS, TRUE, 0);
 
-    if (CreateProcess(NULL, pr00gie, NULL, NULL, TRUE, 0, NULL, NULL,
+    if (CreateProcess(NULL, cmdLine, NULL, NULL, TRUE, 0, NULL, NULL,
                       &si, &ProcessInformation))
     {
         ProcessHandle = ProcessInformation.hProcess;
         CloseHandle(ProcessInformation.hThread);
     }
-    else 
+    else
         holler("StartShell: failed to CreateProcess, error = %s, cmd=%s",
-					(const char *)GetLastErrorAsString().c_str(), pr00gie);
+					(const char *)GetLastErrorAsString().c_str(), cmdLine);
 
-
+    free(cmdLine);
     return(ProcessHandle);
 }
 
