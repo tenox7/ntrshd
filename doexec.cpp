@@ -538,6 +538,10 @@ SessionReadShellThreadFn(
  //           PrevChar = Buffer2[BytesToWrite++] = Buffer[BufferCnt];
    //     }
 
+        if (debugFlag) {
+            fwrite(Buffer, 1, BytesRead, stdout);
+            fflush(stdout);
+        }
         if (send(Session->ClientSocket, (const char *)Buffer, BytesRead, 0) <= 0)
             break;
     }
@@ -599,6 +603,10 @@ SessionReadShellErrThreadFn(
           //  PrevChar = Buffer2[BytesToWrite++] = Buffer[BufferCnt];
         //}
 
+        if (debugFlag) {
+            fwrite(Buffer, 1, BytesRead, stderr);
+            fflush(stderr);
+        }
     	if (send(Session->ClientSocketErr, (const char *)Buffer, BytesRead, 0) <= 0)
             break;
     }
