@@ -11,7 +11,7 @@ VS_VERSION_INFO VERSIONINFO
     {
         BLOCK "080904E4"
         {
-            VALUE "CompanyName",        "https://github.com/ultradumb/rshd\0"
+            VALUE "CompanyName",        "https://github.com/tenox7/ntrshd\0"
             VALUE "FileDescription",    "RSHD\0"
             VALUE "FileVersion",        "FILEVERSION\0"
             VALUE "LegalCopyright",     "Copyright © 2019\0"
