@@ -105,7 +105,7 @@ std::string GetLastErrorAsString()
                                  NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
 
     std::string message(messageBuffer, size-2); // skip newline/cr
-    message = std::to_string(errorMessageID) + ": " + message;
+    message = std::to_string((long long)errorMessageID) + ": " + message;
 
     //Free the buffer.
     LocalFree(messageBuffer);
