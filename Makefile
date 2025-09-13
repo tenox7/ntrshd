@@ -1,6 +1,6 @@
 OBJS = rshd.obj rshd_rcp.obj Service.obj doexec.obj resource.res
 LIBS = advapi32.lib user32.lib ws2_32.lib
-CFLAGS = /O /nologo /DGAPING_SECURITY_HOLE
+CFLAGS = /O /nologo
 
 .cpp.obj:
 	cl $(CFLAGS) /c $<

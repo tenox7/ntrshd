@@ -12,8 +12,6 @@
 #include <winbase.h>
 #include <string>
 
-#ifdef GAPING_SECURITY_HOLE
-
 #ifdef __cplusplus
 #define ExitThread(n) return
 #endif
@@ -664,5 +662,3 @@ SessionWriteShellThreadFn(
 //debug("--->>> SessionWriteShellThreadFn exit <<<---");
 	ExitThread(0);
 }
-
-#endif

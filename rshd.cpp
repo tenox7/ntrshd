@@ -11,9 +11,7 @@
 #include "service.h"
 
 // stuff from doexec.c goes here
-#ifdef GAPING_SECURITY_HOLE
 	BOOL doexec(char *pr00gie, SOCKET ClientSocket, SOCKET ClientSocketErr);
-#endif /* GAPING_SECURITY_HOLE */
 
 // Function prototype for rcp handler
 void rcpCommand(SOCKET rshClient, SOCKET& rshClientErr, char* Cmd );
