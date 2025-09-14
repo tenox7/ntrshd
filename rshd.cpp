@@ -26,7 +26,6 @@ SOCKET rshServer; // the rshd server socket for incoming connections
 int client=0; // number of clients so far (used for debugging purposes only)
 int runFlag=1; // cleared when the rshd daemon is to be shutdown
 int securityFlag=1; // set to loosen up the security when not all information is available on the client
-int noStdout=0, noStderr=0; // redirection flags
 int debugFlag=0;
 int serviceFlag=0; // set to 1 when running as Windows service
 
@@ -326,36 +325,31 @@ void
 #endif /* EBCEEB */
 
     strcpy(buff, comm);
-    if(!noStdout)
+    // stdout redirection on
+    *tempOut=0;
+    if(tempDir)
     {
-        // stdout redirection on 
-        *tempOut=0;
-        if(tempDir)
-        {
-            strcpy(tempOut, tempDir);
+        strcpy(tempOut, tempDir);
 #ifndef VISUALCPP
-            strcat(tempOut, "\\");
+        strcat(tempOut, "\\");
 #endif
-        }
-        tmpnam(tempOut+strlen(tempOut));
-        strcat(buff, " >");
-        strcat(buff, tempOut);
     }
-    if(!noStderr)
+    tmpnam(tempOut+strlen(tempOut));
+    strcat(buff, " >");
+    strcat(buff, tempOut);
+
+    // stderr redirection on
+    *tempErr=0;
+    if(tempDir)
     {
-        // stderr redirection on 
-        *tempErr=0;
-        if(tempDir)
-        {
-            strcpy(tempErr, tempDir);
+        strcpy(tempErr, tempDir);
 #ifndef VISUALCPP
-            strcat(tempErr, "\\");
+        strcat(tempErr, "\\");
 #endif
-        }
-        tmpnam(tempErr+strlen(tempErr));
-        strcat(buff, " 2>");
-        strcat(buff, tempErr);
     }
+    tmpnam(tempErr+strlen(tempErr));
+    strcat(buff, " 2>");
+    strcat(buff, tempErr);
     if(debugFlag)
         fprintf(stderr, "[%d] Executing '%s'...\n", client, buff);
     // run the command and wait for it to end 
@@ -363,22 +357,17 @@ void
 
     // send the results over...
     debug("Sending results...");
-    // stdout goes to the main client port 
-    if(!noStdout)
-    {
-        dumpFile(tempOut, rshClient);
-        unlink(tempOut);
-    }
-    // if an additional port was specified, use it for stderr 
-    if(!noStderr)
-    {
-        if(rshClientErr != INVALID_SOCKET)
-            dumpFile(tempErr, rshClientErr);
-        else
-            // otherwise, send stderr to the same main client port 
-            dumpFile(tempErr, rshClient);
-        unlink(tempErr);
-    }
+    // stdout goes to the main client port
+    dumpFile(tempOut, rshClient);
+    unlink(tempOut);
+
+    // if an additional port was specified, use it for stderr
+    if(rshClientErr != INVALID_SOCKET)
+        dumpFile(tempErr, rshClientErr);
+    else
+        // otherwise, send stderr to the same main client port
+        dumpFile(tempErr, rshClient);
+    unlink(tempErr);
 }
 
 
@@ -880,18 +869,6 @@ void
                 debug("Tight security enabled!");
         }
         else
-        if(!strcmp(argv[i], "-1"))
-        {
-                noStdout=1;
-                debug("No stdout redirection!");
-        }
-        else
-        if(!strcmp(argv[i], "-2"))
-        {
-                noStderr=1;
-                debug("No stderr redirection!");
-        }
-        else
         if(!strcmpi(argv[i], "-v"))
         {
             fprintf(stderr, "\nrshd - remote shell daemon for Windows /95/NT/2k, version %d.%d\n%s",
@@ -931,8 +908,6 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
 \t-remove\tremove the service\n\
 \t-d\tdebug output\n\
 \t-s\ttighter security\n\
-\t-1\tno stdout redirection\n\
-\t-2\tno stderr redirection\n\
 \t-v\tdisplay rshd version\n\
 \t-h\tthis help screen\n", VERSION_MAJOR, VERSION_MINOR);
 
