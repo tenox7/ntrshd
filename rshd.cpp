@@ -25,7 +25,6 @@ u_short rshProto; // the rshd protocol ("tcp")
 SOCKET rshServer; // the rshd server socket for incoming connections
 int client=0; // number of clients so far (used for debugging purposes only)
 int runFlag=1; // cleared when the rshd daemon is to be shutdown
-int securityFlag=1; // set to loosen up the security when not all information is available on the client
 int debugFlag=0;
 int serviceFlag=0; // set to 1 when running as Windows service
 
@@ -863,16 +862,10 @@ void
             serviceFlag=1;
         }
         else
-        if(!strcmpi(argv[i], "-s"))
-        {
-                securityFlag=0;
-                debug("Tight security enabled!");
-        }
-        else
         if(!strcmpi(argv[i], "-v"))
         {
-            fprintf(stderr, "\nrshd - remote shell daemon for Windows /95/NT/2k, version %d.%d\n%s",
-                    VERSION_MAJOR, VERSION_MINOR, "Check http://rshd.sourceforge.net/ for updates\n");
+            fprintf(stderr, "\nrshd - remote shell daemon for Windows NT version %d.%d\n%s",
+                    VERSION_MAJOR, VERSION_MINOR, "Check http://github.com/tenox7/ntrshd for updates\n");
             exit(0);
         }
 #ifdef EBCEEB
@@ -900,14 +893,13 @@ void
         )
         {
 // this is just to be friendly
-            fprintf(stderr,  "\nrshd - remote shell daemon for Windows 95/NT,version %d.%d\n\n\
+            fprintf(stderr,  "\nrshd - remote shell daemon for Windows NT, version %d.%d\n\n\
 Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
 \t-install\tinstall the service\n\
 \t-u <user name>\tIn the form DomainName\\UserName (.\\UserName for local)\n\
 \t-p <user password>\t\n\
 \t-remove\tremove the service\n\
 \t-d\tdebug output\n\
-\t-s\ttighter security\n\
 \t-v\tdisplay rshd version\n\
 \t-h\tthis help screen\n", VERSION_MAJOR, VERSION_MINOR);
 
