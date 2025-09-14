@@ -28,6 +28,7 @@ int runFlag=1; // cleared when the rshd daemon is to be shutdown
 int securityFlag=1; // set to loosen up the security when not all information is available on the client
 int noStdout=0, noStderr=0; // redirection flags
 int debugFlag=0;
+int serviceFlag=0; // set to 1 when running as Windows service
 int winntFlag=0; // OS flag; set if we're running on NT.  The "OS" env. variable has to be set to "Windows_NT"
 int shell4dosFlag=0; // 4DOS shell flag
 
@@ -840,8 +841,8 @@ void
     for(int i=1; i<argc; i++)
         if(!strcmpi(argv[i], "-install"))
         {
-			char* inst_args = (char*)calloc(sizeof(argv), sizeof(char));
-			strcat(inst_args," ");
+			char* inst_args = (char*)calloc(1024, sizeof(char));
+			strcat(inst_args," -service");
 			char* user = NULL;
 			char* password = NULL;
 
@@ -853,8 +854,8 @@ void
 					password = argv[x+1];
 					x++;
 				} else {
-					strcat(inst_args,argv[x]);
 					strcat(inst_args," ");
+					strcat(inst_args,argv[x]);
 				}
 			}
 
@@ -874,6 +875,11 @@ void
             debugFlag=1;
             bDebug = TRUE;
             //comment by EBCEEB: CmdDebugService(argc, argv);
+        }
+        else
+        if(!strcmpi(argv[i], "-service"))
+        {
+            serviceFlag=1;
         }
         else
         if(!strcmpi(argv[i], "-s"))
@@ -961,6 +967,12 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
         winntFlag=1;
     else
         winntFlag=0; // "OS" undefined; most probably Windows 95
+
+    // enable debug flag by default when NOT running as service
+    if (!serviceFlag && !debugFlag) {
+        debugFlag = 1;
+        bDebug = TRUE;
+    }
 
     // placed here by EBCEEB
     if( bDebug )
