@@ -1,6 +1,8 @@
 
 #include "winver.h"
 
+1 ICON "rshd.ico"
+
 VS_VERSION_INFO VERSIONINFO
     FILEVERSION    1,9,0,0
     PRODUCTVERSION 1,9,0,0
@@ -14,7 +16,7 @@ VS_VERSION_INFO VERSIONINFO
             VALUE "CompanyName",        "https://github.com/tenox7/ntrshd\0"
             VALUE "FileDescription",    "RSHD\0"
             VALUE "FileVersion",        "FILEVERSION\0"
-            VALUE "LegalCopyright",     "Copyright © 2019\0"
+            VALUE "LegalCopyright",     "Copyright ï¿½ 2019\0"
             VALUE "OriginalFilename",   "rshd.exe\0"
             VALUE "ProductName",        "RSH Daemon for Windows\0"
             VALUE "ProductVersion",     "V1.9.0.0\0"
