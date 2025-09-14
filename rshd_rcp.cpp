@@ -61,7 +61,7 @@ RcpReceive( SOCKET rshClient, char*buff, int blen )
                                 error("Cannot receive client data.", 0);
                                 return( rlen );
                         }
-                        if(debugFlag)
+                        /*if(debugFlag)
                         {
                                 if ( !rlen )
                                         fprintf(stderr, "[%d] ...got %d chars. \n", 
@@ -69,7 +69,7 @@ RcpReceive( SOCKET rshClient, char*buff, int blen )
                                 else
                                         fprintf(stderr, "[%d] ...got %d chars. [%c]\n", 
                                                 client, rlen, buff[i] );
-                        }
+                        }*/
                         tchar = buff[i];
                         i+=1;
                         if ( i > blen )

@@ -225,8 +225,8 @@ int
         bufflen=recv(rshClient, buff+totallen, blen-totallen, 0);
         if(bufflen==SOCKET_ERROR)
             return bufflen;
-        if(debugFlag)
-            fprintf(stderr, " ...got %d chars.\n", bufflen);
+        //if(debugFlag)
+            //fprintf(stderr, " ...got %d chars.\n", bufflen);
         totallen+=bufflen;
 
     } while(bufflen && totallen<blen && buff[totallen-1]);
