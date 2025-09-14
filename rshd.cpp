@@ -16,42 +16,30 @@
 // Function prototype for rcp handler
 void rcpCommand(SOCKET rshClient, SOCKET& rshClientErr, char* Cmd );
 
-// the .rhosts file path, relative to the "windir" directory
-#define RHOSTS "rhosts"
-
 // the rshd shutdown command
 #define RSH_SHUTDOWN "stoprsh"
 
-struct sockaddr_in anaddr; // socket address structure 
+struct sockaddr_in anaddr; // socket address structure
 u_short rshPort; // the rshd port; basically, the 'cmd' port from services
 u_short rshProto; // the rshd protocol ("tcp")
-SOCKET rshServer; // the rshd server socket for incoming connections 
+SOCKET rshServer; // the rshd server socket for incoming connections
 int client=0; // number of clients so far (used for debugging purposes only)
 int runFlag=1; // cleared when the rshd daemon is to be shutdown
-int securityFlag=1; // set to loosen up the security when not all information is available on the client 
-int noRHosts=0; // set in order to disable .rhosts checking 
-int noStdout=0, noStderr=0; // redirection flags 
+int securityFlag=1; // set to loosen up the security when not all information is available on the client
+int noStdout=0, noStderr=0; // redirection flags
 int debugFlag=0;
 int winntFlag=0; // OS flag; set if we're running on NT.  The "OS" env. variable has to be set to "Windows_NT"
-int shell4dosFlag=0; // 4DOS shell flag 
+int shell4dosFlag=0; // 4DOS shell flag
 
 #ifdef EBCEEB
 int inputCygnusFlag;
 int inputUnixFlag;
 #endif /* EBCEEB */
 
-// socket options variables 
+// socket options variables
 int on=1;
 struct linger linger;
 #define LINGER_TIME 10
-
-// the trusted host list; loaded from the .rhosts file 
-struct _rhosts
-{
-  char* hostname;
-	char* username;
-  struct _rhosts* next;
-}* rhostsList=NULL;
 
 // debug //////////////////////////////////////////////////////////////////////
 //
@@ -541,49 +529,22 @@ int
 }
 
 
-// hostAndUserCheck //////////////////////////////////////////////////////////////
-//
-// performs a security check on the remote hostname, username;
-// normally, the host and user should be listed in the .rhosts file
-//
-// taken from https://github.com/VladislavShcherba/RSHD/blob/master/rshd.cpp
-int
-    hostAndUserCheck (char* hostname, char* username)
-{
-    if (debugFlag)
-    	fprintf(stderr, "[%d] Checking host '%s' and user '%s' against the .rhosts file...\n", client, hostname, username);
-    struct _rhosts* ptr=rhostsList;
-    while(ptr)
-    {
-        if(!strcmpi(ptr->hostname, hostname) && !strcmpi(ptr->username, username) || !strcmpi(ptr->hostname, "+"))
-            return 1;
-        ptr=ptr->next;
-    }
-    fprintf(stderr, "[%d] Access denied to host %s - %s...\n", client, hostname, username);
-    return 0;
-}
-
 
 // clientCheck ////////////////////////////////////////////////////////////////
 //
 // performs a security clearance on the remote client;
-// the following things should check:
-// - the foreign port should be in the 512-1023 range;
-// - the remote host should be listed in the .rhosts file;
-// - the remote client should be allowed to login from the remote host
-// the 'securityFlag' is used to resolve the cases when not enough
-// information is available (the default is to let people pass)
+// simplified client check - always allows access
 //
 int
     clientCheck (SOCKET rshClient, char *username)
 {
-    // get the necessary info on the client socket 
+    // get the necessary info on the client socket
     struct sockaddr_in cliaddr;
     int len=sizeof(cliaddr);
     if(getpeername(rshClient, (struct sockaddr FAR*)&cliaddr, &len))
     {
         error("Cannot determine client's IP address!", 0);
-        return securityFlag;
+        return 1; // allow access even if we can't get IP
     }
 		// set environment variable to recognize client later
 		char putenv_buf[1024];
@@ -591,31 +552,7 @@ int
 		if (debugFlag) fprintf(stderr, "[%d] Environment %s\n", client, putenv_buf);
 		_putenv (putenv_buf);
 
-    // make sure the client port is within the reserved  range 
-    cliaddr.sin_port=ntohs(cliaddr.sin_port);
-    if(debugFlag)
-        fprintf(stderr, "[%d] Client port: %d...\n", client, cliaddr.sin_port);
-    if(cliaddr.sin_port<512 || cliaddr.sin_port>1023)
-    {
-        fprintf(stderr, "[%d] Client port outside the 512-1023 range!\n",
-            client);
-        return 0;
-    }
-
-    // now, check the remote host 
-    if(noRHosts)
-        return 1; // .rhosts checking disabled 
-    struct hostent* remoteHostPtr=gethostbyaddr((const char FAR*)&cliaddr.sin_addr,
-        4, PF_INET);
-    if(!remoteHostPtr)
-    {
-        fprintf(stderr, "[%d] Cannot determine remote host credentials!\n", client);
-        return securityFlag;
-    }
-//    if(debugFlag)
-//        fprintf(stderr, "[%d] Client host: %s...\n", client,
-//            remoteHostPtr->h_name);
-    return hostAndUserCheck(remoteHostPtr->h_name, username);
+    return 1; // always allow access
 }
 
 //
@@ -963,12 +900,6 @@ void
                 debug("Running in 4DOS!");
         }
         else
-        if(!strcmpi(argv[i], "-r"))
-        {
-                noRHosts=1;
-                debug(".rhosts checking disabled!");
-        }
-        else
         if(!strcmpi(argv[i], "-v"))
         {
             fprintf(stderr, "\nrshd - remote shell daemon for Windows /95/NT/2k, version %d.%d\n%s",
@@ -1007,7 +938,6 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
 \t-p <user password>\t\n\
 \t-remove\tremove the service\n\
 \t-d\tdebug output\n\
-\t-r\tno .rhosts checking\n\
 \t-s\ttighter security\n\
 \t-4\t4DOS or 4NT command shell\n\
 \t-1\tno stdout redirection\n\
@@ -1041,53 +971,6 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
 }
 
 
-// loadRHosts /////////////////////////////////////////////////////////////////
-//
-// create a list of trusted hosts from the .rhosts file
-//
-void
-    loadRHosts ()
-{
-    rhostsList=NULL;
-    char* windir=getenv("windir");
-    if(!windir)
-        error("The WINDIR environment variable is not set!");
-    char rhosts[256];
-    strcpy(rhosts, windir);
-    strcat(rhosts, "\\");
-    strcat(rhosts, RHOSTS);
-    if(debugFlag)
-        fprintf(stderr, "[%d] Loading %s...\n", client, rhosts);
-    FILE* rhostsFile=fopen(rhosts, "r");
-    if(!rhostsFile)
-        error("Cannot open the .rhosts file.  Either create one or use the '-r' option...");
-    char buff[1024];
-    buff[1023]=0;
-    while(!feof(rhostsFile))
-    {
-        fgets(buff, 1023, rhostsFile);
-        if(feof(rhostsFile))
-            break;
-        int i=0;
-        if(buff[i]=='#')
-            continue; // ignoring comment line 
-        while(buff[i] && buff[i]!=' ' && buff[i]!='\t' && buff[i]!='\n')
-            i++;
-        if(!i)
-            continue; // empty line 
-        char* hostname=(char*)calloc(sizeof(char), i+1);
-        strncpy(hostname, buff, i);
-        struct _rhosts* rhostCell=new struct _rhosts;
-        if(!rhostCell)
-            error("Heap overflow!");
-        rhostCell->next=rhostsList;
-        rhostCell->hostname=hostname;
-        rhostsList=rhostCell;
-        if(debugFlag)
-            fprintf(stderr, "[%d] Trusting host %s...\n", client, hostname);
-    }
-    fclose(rhostsFile);
-}
 
 
 // main ///////////////////////////////////////////////////////////////////////
@@ -1171,8 +1054,6 @@ VOID ServiceStart (DWORD dwArgc, LPTSTR *lpszArgv)
 
         // now, do the real work
     winsockCheck();
-    if(!noRHosts)
-        loadRHosts();
 
     // report the status to the service control manager.
     //
