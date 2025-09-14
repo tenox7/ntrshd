@@ -29,8 +29,6 @@ int securityFlag=1; // set to loosen up the security when not all information is
 int noStdout=0, noStderr=0; // redirection flags
 int debugFlag=0;
 int serviceFlag=0; // set to 1 when running as Windows service
-int winntFlag=0; // OS flag; set if we're running on NT.  The "OS" env. variable has to be set to "Windows_NT"
-int shell4dosFlag=0; // 4DOS shell flag
 
 #ifdef EBCEEB
 int inputCygnusFlag;
@@ -327,10 +325,7 @@ void
 
 #endif /* EBCEEB */
 
-    if(shell4dosFlag)
-        sprintf(buff, "(%s)", comm);
-    else
-        strcpy(buff, comm);
+    strcpy(buff, comm);
     if(!noStdout)
     {
         // stdout redirection on 
@@ -346,7 +341,7 @@ void
         strcat(buff, " >");
         strcat(buff, tempOut);
     }
-    if(!noStderr && (winntFlag || shell4dosFlag))
+    if(!noStderr)
     {
         // stderr redirection on 
         *tempErr=0;
@@ -358,10 +353,7 @@ void
 #endif
         }
         tmpnam(tempErr+strlen(tempErr));
-        if(shell4dosFlag)
-            strcat(buff, " >&>");
-        else
-            strcat(buff, " 2>");
+        strcat(buff, " 2>");
         strcat(buff, tempErr);
     }
     if(debugFlag)
@@ -378,7 +370,7 @@ void
         unlink(tempOut);
     }
     // if an additional port was specified, use it for stderr 
-    if(!noStderr && (winntFlag || shell4dosFlag))
+    if(!noStderr)
     {
         if(rshClientErr != INVALID_SOCKET)
             dumpFile(tempErr, rshClientErr);
@@ -900,12 +892,6 @@ void
                 debug("No stderr redirection!");
         }
         else
-        if(!strcmp(argv[i], "-4"))
-        {
-                shell4dosFlag=1;
-                debug("Running in 4DOS!");
-        }
-        else
         if(!strcmpi(argv[i], "-v"))
         {
             fprintf(stderr, "\nrshd - remote shell daemon for Windows /95/NT/2k, version %d.%d\n%s",
@@ -945,7 +931,6 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
 \t-remove\tremove the service\n\
 \t-d\tdebug output\n\
 \t-s\ttighter security\n\
-\t-4\t4DOS or 4NT command shell\n\
 \t-1\tno stdout redirection\n\
 \t-2\tno stderr redirection\n\
 \t-v\tdisplay rshd version\n\
@@ -962,11 +947,6 @@ Usage:\n\trshd [ -dhrvs124 ]\n\nCommand line options:\n\
             fprintf(stderr, "Ignoring unknown option '%s'...\n", argv[i]);
 
     // since we're here, check some environment variables
-    char* os=getenv("OS");
-    if(os && !strcmp(os, "Windows_NT"))
-        winntFlag=1;
-    else
-        winntFlag=0; // "OS" undefined; most probably Windows 95
 
     // enable debug flag by default when NOT running as service
     if (!serviceFlag && !debugFlag) {
