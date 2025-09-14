@@ -546,7 +546,7 @@ SessionReadShellThreadFn(
             break;
     }
 
-    if (GetLastError() != ERROR_BROKEN_PIPE)
+    if (GetLastError() != ERROR_BROKEN_PIPE && GetLastError() != ERROR_INVALID_HANDLE)
         holler("SessionReadShellThreadFn: exited, error = %s",
 							GetLastErrorAsString());
 //    debug("SessionReadShellThreadFn: closing Session->ClientSocket...");
@@ -611,7 +611,7 @@ SessionReadShellErrThreadFn(
             break;
     }
 
-    if (GetLastError() != ERROR_BROKEN_PIPE)
+    if (GetLastError() != ERROR_BROKEN_PIPE && GetLastError() != ERROR_INVALID_HANDLE)
         holler("SessionReadShellErrThreadFn exited, error = %s",
 					GetLastErrorAsString());
 //debug("*** SessionReadShellErrThreadFn exit ***");
