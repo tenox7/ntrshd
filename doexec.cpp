@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <winsock2.h>
 #include <winbase.h>
-#include <string>
+#include <string.h>
 
 #ifdef __cplusplus
 #define ExitThread(n) return
@@ -91,24 +91,24 @@ static void holler (const char *str, ...) {
 	}
 }
 
-std::string GetLastErrorAsString()
+char* GetLastErrorAsString()
 {
     //Get the error message, if any.
-    DWORD errorMessageID = ::GetLastError();
+    DWORD errorMessageID = GetLastError();
     if(errorMessageID == 0)
-        return std::string(); //No error message has been recorded
+        return ""; //No error message has been recorded
 
-    LPSTR messageBuffer = nullptr;
+    LPSTR messageBuffer = NULL;
     size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                                  NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
 
-    std::string message(messageBuffer, size-2); // skip newline/cr
-    message = std::to_string((long long)errorMessageID) + ": " + message;
+    static char result[512];
+    sprintf(result, "%d: %.*s", errorMessageID, (int)(size-2), messageBuffer);
 
     //Free the buffer.
     LocalFree(messageBuffer);
 
-    return message;
+    return result;
 }
 
 // **********************************************************************
@@ -161,14 +161,14 @@ CreateSession(
                           &SecurityAttributes, 0);
     if (!Result) {
         holler("CreateSession: failed to create shell stdout pipe, error = %s",
-					(const char *)GetLastErrorAsString().c_str());
+					GetLastErrorAsString());
         goto Failure;
     }
     Result = CreatePipe(&ShellStdinPipe, &Session->WritePipeHandle,
                         &SecurityAttributes, 0);
     if (!Result) {
         holler("CreateSession: failed to create shell stdin pipe, error = %s",
-					(const char *)GetLastErrorAsString().c_str());
+					GetLastErrorAsString());
         goto Failure;
     }
 		//----------------------
@@ -177,7 +177,7 @@ CreateSession(
                         &SecurityAttributes, 0);
     	if (!Result) {
       	  holler("CreateSession: failed to create shell stderr pipe, error = %s",
-							(const char *)GetLastErrorAsString().c_str());
+							GetLastErrorAsString());
         	goto Failure;
     	}
 		}
@@ -277,7 +277,7 @@ doexec(
 
     if (Session->ReadShellThreadHandle == NULL) {
         holler("doexec: failed to create ReadShell session thread, error = %s",
-					(const char *)GetLastErrorAsString().c_str());
+					GetLastErrorAsString());
 
         //
         // Reset the client pipe handle to indicate this session is disconnected
@@ -294,7 +294,7 @@ doexec(
 
     			if (Session->ReadShellErrThreadHandle == NULL) {
         			holler("doexec: failed to create ReadShellErr session thread, error = %s",
-								(const char *)GetLastErrorAsString().c_str());
+								GetLastErrorAsString());
 
         			//
         			// Reset the client pipe handle to indicate this session is disconnected
@@ -313,7 +313,7 @@ doexec(
 
     if (Session->WriteShellThreadHandle == NULL) {
         holler("doexec: failed to create WriteShell session thread, error = %s",
-					(const char *)GetLastErrorAsString().c_str());
+					GetLastErrorAsString());
 
         //
         // Reset the client pipe handle to indicate this session is disconnected
@@ -373,7 +373,7 @@ doexec(
 
 		  default:
 		      holler("doexec: WaitForMultipleObjects error: %s",
-						(const char *)GetLastErrorAsString().c_str());
+						GetLastErrorAsString());
 		
 		      break;
     }
@@ -485,7 +485,7 @@ StartShell(
     }
     else
         holler("StartShell: failed to CreateProcess, error = %s, cmd=%s",
-					(const char *)GetLastErrorAsString().c_str(), cmdLine);
+					GetLastErrorAsString(), cmdLine);
 
     free(cmdLine);
     return(ProcessHandle);
@@ -548,7 +548,7 @@ SessionReadShellThreadFn(
 
     if (GetLastError() != ERROR_BROKEN_PIPE)
         holler("SessionReadShellThreadFn: exited, error = %s",
-							(const char *)GetLastErrorAsString().c_str());
+							GetLastErrorAsString());
 //    debug("SessionReadShellThreadFn: closing Session->ClientSocket...");
 //    shutdown(Session->ClientSocket, SD_RECEIVE); // 2
 //    closesocket(Session->ClientSocket);
@@ -613,7 +613,7 @@ SessionReadShellErrThreadFn(
 
     if (GetLastError() != ERROR_BROKEN_PIPE)
         holler("SessionReadShellErrThreadFn exited, error = %s",
-					(const char *)GetLastErrorAsString().c_str());
+					GetLastErrorAsString());
 //debug("*** SessionReadShellErrThreadFn exit ***");
 	ExitThread(0);
 }
