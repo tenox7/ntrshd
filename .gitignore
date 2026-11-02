@@ -1,0 +1,12 @@
+# build output
+*.obj
+*.exe
+*.res
+*.RES
+*.rbj
+
+# runtime log
+ntrshd.log
+
+# macOS
+.DS_Store
