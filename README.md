@@ -56,6 +56,10 @@ ntrshd [options]
   -h           help
 ```
 
+**One ntrshd per port.** If another ntrshd already serves the port (in
+another window, or as the service), a new one says so and does not start.
+To run a second one, give it its own port with `-p`.
+
 ### As a service
 
 ```
@@ -76,7 +80,9 @@ drive (say `T:`) and the service still starts at boot, when no mapped drive
 exists yet. `-remove` deletes that copy again.
 
 Start it after installing with `net start ntrshd` (or from Control Panel →
-Services), stop with `net stop ntrshd`.
+Services), stop with `net stop ntrshd`. If an ntrshd in a console window
+already serves the port, the service does not start: `net start` reports
+system error 1056.
 
 ## How it behaves
 
@@ -98,7 +104,9 @@ Services), stop with `net stop ntrshd`.
   IP, and the running sessions with their commands — refreshed about once a
   second, with the connection count in the title bar. Command output is **not**
   echoed to the window; it goes only to the client. (This also means large
-  output is no longer slowed by writing every line to the screen.)
+  output is no longer slowed by writing every line to the screen.) If some
+  other program holds the port, the status line and the title bar say
+  **NOT LISTENING**, and ntrshd tries again every 10 seconds.
 - **Logging:** every event (connect, command, process id, bytes sent, exit
   code, and how the session ended) is written to `ntrshd.log` next to the exe,
   in both console and service mode. `-q` replaces the status window with a
@@ -106,7 +114,8 @@ Services), stop with `net stop ntrshd`.
 - **`Ctrl+C` or `Ctrl+Break` quits.** The first press stops accepting new
   connections and gives the running commands a few seconds to stop; press
   again to kill everything and exit at once (for when something is wedged).
-  Closing the window also quits.
+  **Closing the window** quits at once: it kills the running commands and
+  tells their clients.
 
 ## Capabilities by NT version
 

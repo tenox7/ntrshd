@@ -78,7 +78,7 @@
 #define SVCAPI WINAPI
 #endif
 
-#define RSHD_VERSION "1.0"
+#define RSHD_VERSION "1.1"
 #define RSH_PORT 514
 #define FIELD_SIZE 256
 #define CMD_SIZE 4096
@@ -97,6 +97,9 @@
 #define MAX_RUNNING 128
 #define LISTEN_BACKLOG 200     /* winsock.h SOMAXCONN is only 5; NT Server honours up to 200 */
 #define ACCEPT_FAILS 10
+#define CLAIM_WAIT_MS 2000     /* wait this long for another ntrshd to let go of the port */
+#define CLOSE_WAIT_MS 2000     /* window closed: give the sessions this long to finish */
+#define HOLD_MS 60000          /* a startup error stays on a double-clicked window this long */
 
 /* service identity */
 #define SVC_NAME "ntrshd"
@@ -108,6 +111,12 @@
 #define STOP_SIGNAL 2
 #define STOP_GONE 3
 #define STOP_SHUTDOWN 4
+
+/* the listening port, as the status window shows it */
+#define PORT_OPENING 0
+#define PORT_LISTENING 1
+#define PORT_TAKEN 2           /* another program answers on the port */
+#define PORT_FAILED 3          /* bind or listen failed with portError */
 
 typedef struct {
     SOCKET sock;               /* main channel: stdout to client, stdin from client */
@@ -153,6 +162,11 @@ static int rshPort = RSH_PORT;
 static int asService = 0;
 static FILE *logFile = NULL;
 static volatile int runFlag = 1;
+static HANDLE quitEvent = NULL;     /* set when a quit is asked for: wakes every wait */
+static HANDLE portMutex = NULL;     /* owned while this process serves the port */
+static int ownConsole = 0;          /* the console window is ours alone (double-clicked) */
+static volatile int portState = PORT_OPENING;
+static volatile int portError = 0;
 
 static SERVICE_STATUS svcStatus;
 static SERVICE_STATUS_HANDLE svcStatusHandle = 0;
@@ -604,6 +618,50 @@ static int stopAll(int why) {
     return count;
 }
 
+/* kills every running command at once; each session thread then ends its
+   client as usual (see copyOutput) */
+static void killAll(void) {
+    CONN *c;
+    int i;
+
+    EnterCriticalSection(&runLock);
+    for (i = 0; i < MAX_RUNNING; i++) {
+        c = running[i];
+        if (c != NULL && c->proc != NULL) {
+            TerminateProcess(c->proc, CONTROL_C_EXIT);
+        }
+    }
+    LeaveCriticalSection(&runLock);
+}
+
+static int countRunning(void) {
+    int i;
+    int n;
+
+    n = 0;
+    EnterCriticalSection(&runLock);
+    for (i = 0; i < MAX_RUNNING; i++) {
+        if (running[i] != NULL) {
+            n++;
+        }
+    }
+    LeaveCriticalSection(&runLock);
+    return n;
+}
+
+/* After a quit is requested, wait up to graceMs for the running commands to
+   stop on their own: each one is sent CTRL_BREAK and then hard-killed by its
+   own session thread (see stopAll / copyOutput).  A second Ctrl+C makes the
+   handler end the process without waiting. */
+static void drainCommands(DWORD graceMs) {
+    DWORD start;
+
+    start = GetTickCount();
+    while (countRunning() > 0 && GetTickCount() - start < graceMs) {
+        Sleep(100);
+    }
+}
+
 /* -------- the output path ------------------------------------------------ */
 
 /* a message for the client once its output has started: on the stderr
@@ -725,7 +783,8 @@ static DWORD copyOutput(CONN *c) {
             if (emptyAt == 0) {
                 emptyAt = GetTickCount();
             }
-            if (GetTickCount() - emptyAt >= grandGrace) {
+            /* quitting: no point waiting for a grandchild's output */
+            if (GetTickCount() - emptyAt >= grandGrace || c->stopWhy == STOP_SHUTDOWN) {
                 break;
             }
         } else if (idleLimit != 0 && c->stopWhy == STOP_NONE && GetTickCount() - quiet >= idleLimit) {
@@ -1300,6 +1359,24 @@ static void startConn(SOCKET s, struct sockaddr_in *peer, int id) {
 
 /* -------- the listener --------------------------------------------------- */
 
+/* sleeps, but wakes at once when a quit is asked for */
+static void quitWait(DWORD ms) {
+    if (quitEvent == NULL || WaitForSingleObject(quitEvent, ms) == WAIT_FAILED) {
+        Sleep(ms);
+    }
+}
+
+/* closes the listening socket once, whichever thread comes first; this
+   also wakes the main thread out of accept() */
+static void closeListener(void) {
+    SOCKET s;
+
+    s = (SOCKET)InterlockedExchange((LONG *)&listener, (LONG)INVALID_SOCKET);
+    if (s != INVALID_SOCKET) {
+        closesocket(s);
+    }
+}
+
 static SOCKET bindListener(int port, int reuse) {
     struct sockaddr_in addr;
     SOCKET s;
@@ -1376,7 +1453,8 @@ static SOCKET openListener(int port) {
     err = WSAGetLastError();
     if (s == INVALID_SOCKET && err == WSAEADDRINUSE) {
         if (portAnswers(port)) {
-            logMsg("port %d is taken: another rshd runs, or a program an old rshd started still holds it", port);
+            portState = PORT_TAKEN;
+            logMsg("port %d is in use by another program (another rsh server, or a program an old ntrshd started)", port);
             return INVALID_SOCKET;
         }
         logMsg("port %d is held only by connections that are closing, reusing it", port);
@@ -1384,9 +1462,12 @@ static SOCKET openListener(int port) {
         err = WSAGetLastError();
     }
     if (s != INVALID_SOCKET) {
+        portState = PORT_LISTENING;
         logMsg("listening on port %d", port);
         return s;
     }
+    portError = err;
+    portState = PORT_FAILED;
     logMsg("cannot listen on port %d, error %d", port, err);
     return INVALID_SOCKET;
 }
@@ -1403,7 +1484,7 @@ static SOCKET startListener(int port) {
             return s;
         }
         logMsg("trying again in %d seconds", RETRY_SECONDS);
-        Sleep(RETRY_SECONDS * 1000);
+        quitWait(RETRY_SECONDS * 1000);
     }
 }
 
@@ -1423,6 +1504,9 @@ static void acceptLoop(int port) {
             if (listener == INVALID_SOCKET) {
                 return;
             }
+            if (!runFlag) {
+                return;   /* a quit came while the port was opening; serve() closes it */
+            }
             logMsg("waiting for connections");
         }
         len = sizeof(peer);
@@ -1438,11 +1522,10 @@ static void acceptLoop(int port) {
             logMsg("accept failed, error %d", WSAGetLastError());
             if (fails >= ACCEPT_FAILS) {
                 logMsg("the listening socket looks broken, opening it again");
-                closesocket(listener);
-                listener = INVALID_SOCKET;
+                closeListener();
                 fails = 0;
             }
-            Sleep(1000);
+            quitWait(1000);
             continue;
         }
         fails = 0;
@@ -1459,50 +1542,94 @@ static void serve(int port) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             logMsg("internal error %08lx while accepting, starting over", GetExceptionCode());
         }
-        if (listener != INVALID_SOCKET) {
-            closesocket(listener);
-            listener = INVALID_SOCKET;
-        }
+        closeListener();
         if (runFlag) {
-            Sleep(1000);
+            quitWait(1000);
         }
+    }
+}
+
+/* -------- one ntrshd per port -------------------------------------------- */
+
+/*
+ * Two ntrshd on one port would fight over it, so each one owns a named
+ * mutex for its port while it serves.  Windows lets go of the mutex when
+ * the owner ends, however it ends.  Wait a moment for it, in case the other
+ * ntrshd was just told to quit.  The calling thread owns the mutex, so the
+ * same thread must call releasePort.
+ */
+static int claimPort(int port) {
+    char name[32];
+    DWORD r;
+
+    sprintf(name, "ntrshd-port-%d", port);
+    portMutex = CreateMutex(NULL, FALSE, name);
+    if (portMutex == NULL) {
+        /* access denied: an ntrshd under another account (the service) made
+           it; any other failure: let the port check decide */
+        return GetLastError() != ERROR_ACCESS_DENIED;
+    }
+    r = WaitForSingleObject(portMutex, CLAIM_WAIT_MS);
+    if (r == WAIT_TIMEOUT) {
+        CloseHandle(portMutex);
+        portMutex = NULL;
+        return 0;
+    }
+    return 1;   /* ours; WAIT_ABANDONED means the last owner died holding it */
+}
+
+static void releasePort(void) {
+    if (portMutex != NULL) {
+        ReleaseMutex(portMutex);
+        CloseHandle(portMutex);
+        portMutex = NULL;
     }
 }
 
 /* -------- console control ------------------------------------------------ */
 
-/* Ctrl+C, Ctrl+Break, or closing the window all quit.  The first interrupt is
-   graceful: it stops accepting and signals every running command to stop, each
-   getting CTRL_BREAK and then a hard kill after a grace period (see
-   drainCommands).  A second interrupt kills every command at once and exits
-   right away, for when something is wedged. */
-static BOOL WINAPI onCtrl(DWORD type) {
-    CONN *c;
-    int i;
+/* stops accepting and tells every running command to stop; each session
+   thread sends CTRL_BREAK, then kills its command after a grace period
+   (see copyOutput) */
+static void requestQuit(void) {
+    runFlag = 0;
+    if (quitEvent != NULL) {
+        SetEvent(quitEvent);
+    }
+    stopAll(STOP_SHUTDOWN);
+    closeListener();
+}
 
-    (void)type;
+/*
+ * Ctrl+C or Ctrl+Break quits.  The first press is graceful: it stops
+ * accepting and tells every running command to stop, and the main thread
+ * waits for them (see drainCommands).  A second press kills every command
+ * and exits at once, for when something is wedged.
+ *
+ * Closing the window, logging off and shutting down quit at once, from
+ * inside this handler.  It must not return TRUE for those: NT 3.x and 4.0
+ * then keep the window and ask the user to End Task the program, and newer
+ * Windows kill the process as soon as the handler returns.  So kill the
+ * commands, give the sessions a moment to tell their clients, and exit.
+ */
+static BOOL WINAPI onCtrl(DWORD type) {
+    if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+        logMsg("%s: killing all commands and quitting",
+               type == CTRL_CLOSE_EVENT ? "window closed" : "logoff or shutdown");
+        requestQuit();
+        killAll();
+        drainCommands(CLOSE_WAIT_MS);
+        ExitProcess(0);
+        return FALSE;   /* not reached */
+    }
     if (runFlag) {
         logMsg("quitting: stopping commands (press Ctrl+C again to kill now)");
-        runFlag = 0;
-        stopAll(STOP_SHUTDOWN);
-        if (listener != INVALID_SOCKET) {
-            closesocket(listener);
-        }
+        requestQuit();
         return TRUE;   /* handled: the main thread drains, then the process exits */
     }
     /* a second interrupt: do not wait, kill everything and let the process end */
     logMsg("second interrupt: killing all commands now");
-    EnterCriticalSection(&runLock);
-    for (i = 0; i < MAX_RUNNING; i++) {
-        c = running[i];
-        if (c == NULL) {
-            continue;
-        }
-        if (c->proc != NULL) {
-            TerminateProcess(c->proc, CONTROL_C_EXIT);
-        }
-    }
-    LeaveCriticalSection(&runLock);
+    killAll();
     return FALSE;
 }
 
@@ -1534,11 +1661,7 @@ static void SVCAPI serviceCtrl(DWORD code) {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
         reportStatus(SERVICE_STOP_PENDING, NO_ERROR, 3000);
-        runFlag = 0;
-        stopAll(STOP_SHUTDOWN);
-        if (listener != INVALID_SOCKET) {
-            closesocket(listener);
-        }
+        requestQuit();
         return;
     default:
         break;
@@ -1631,10 +1754,16 @@ static void SVCAPI serviceMain(DWORD argc, LPTSTR *argv) {
     reportStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
     openLogFile();
     logMsg("ntrshd %s service starting", RSHD_VERSION);
+    if (!claimPort(rshPort)) {
+        logMsg("another ntrshd is already serving port %d (in a console window?); the service will not start", rshPort);
+        reportStatus(SERVICE_STOPPED, ERROR_SERVICE_ALREADY_RUNNING, 0);
+        return;
+    }
     if (beginServe()) {
         reportStatus(SERVICE_RUNNING, NO_ERROR, 0);
         serve(rshPort);
     }
+    releasePort();
     logMsg("ntrshd service stopped");
     reportStatus(SERVICE_STOPPED, NO_ERROR, 0);
 }
@@ -1927,28 +2056,17 @@ static void clearScreen(HANDLE h) {
 static void setTitle(int ns) {
     char title[64];
 
-    if (ns <= 0) {
+    if (portState == PORT_OPENING) {
+        strcpy(title, "NTRSHD: STARTING");
+    } else if (portState != PORT_LISTENING) {
+        strcpy(title, "NTRSHD: NOT LISTENING");
+    } else if (ns <= 0) {
         strcpy(title, "NTRSHD: IDLE");
     } else {
         _snprintf(title, sizeof(title) - 1, "NTRSHD: %d conn", ns);
         title[sizeof(title) - 1] = 0;
     }
     SetConsoleTitle(title);
-}
-
-static int countRunning(void) {
-    int i;
-    int n;
-
-    n = 0;
-    EnterCriticalSection(&runLock);
-    for (i = 0; i < MAX_RUNNING; i++) {
-        if (running[i] != NULL) {
-            n++;
-        }
-    }
-    LeaveCriticalSection(&runLock);
-    return n;
 }
 
 /* redraws the whole status window: header plus one row per running command */
@@ -2009,8 +2127,18 @@ static void drawStatus(void) {
     _snprintf(line, sizeof(line) - 1, "host %s   IP %s", hostLabel, ipLabel);
     line[sizeof(line) - 1] = 0;
     putLine(h, row++, w, line);
-    _snprintf(line, sizeof(line) - 1, "port %d   up %lu:%02lu:%02lu   sessions %d",
-              rshPort, up / 3600, (up / 60) % 60, up % 60, ns);
+    if (portState == PORT_LISTENING) {
+        _snprintf(line, sizeof(line) - 1, "port %d   up %lu:%02lu:%02lu   sessions %d",
+                  rshPort, up / 3600, (up / 60) % 60, up % 60, ns);
+    } else if (portState == PORT_TAKEN) {
+        _snprintf(line, sizeof(line) - 1, "port %d: NOT LISTENING - another program has it; retry every %d s",
+                  rshPort, RETRY_SECONDS);
+    } else if (portState == PORT_FAILED) {
+        _snprintf(line, sizeof(line) - 1, "port %d: NOT LISTENING - error %d; retry every %d s",
+                  rshPort, portError, RETRY_SECONDS);
+    } else {
+        _snprintf(line, sizeof(line) - 1, "port %d: opening", rshPort);
+    }
     line[sizeof(line) - 1] = 0;
     putLine(h, row++, w, line);
     putLine(h, row++, w, "no security: anyone who can reach this port runs commands here");
@@ -2047,16 +2175,50 @@ static void statusThread(void *arg) {
     }
 }
 
-/* After a quit is requested, wait up to graceMs for the running commands to
-   stop on their own: each one is sent CTRL_BREAK and then hard-killed by its
-   own session thread (see stopAll / copyOutput).  A second Ctrl+C makes the
-   handler end the process without waiting. */
-static void drainCommands(DWORD graceMs) {
-    DWORD start;
+/* true when ntrshd got a console window of its own (double-clicked, or
+   started with "start"): it is still empty, with the cursor in the top left
+   corner.  Run from a prompt, the cursor is below the command line. */
+static int consoleIsOurs(void) {
+    CONSOLE_SCREEN_BUFFER_INFO sbi;
 
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &sbi)) {
+        return 0;
+    }
+    return sbi.dwCursorPosition.X == 0 && sbi.dwCursorPosition.Y == 0;
+}
+
+/* a console window of its own closes the moment ntrshd exits, so after a
+   startup error keep it open until a key is pressed (at most HOLD_MS), or
+   the message is gone before anyone can read it */
+static void holdWindow(void) {
+    INPUT_RECORD rec;
+    HANDLE in;
+    DWORD start;
+    DWORD r;
+    DWORD n;
+
+    if (!ownConsole) {
+        return;
+    }
+    in = GetStdHandle(STD_INPUT_HANDLE);
+    if (in == NULL || in == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    printf("\nPress any key to close this window.\n");
+    fflush(stdout);
+    FlushConsoleInputBuffer(in);
     start = GetTickCount();
-    while (countRunning() > 0 && GetTickCount() - start < graceMs) {
-        Sleep(100);
+    while (GetTickCount() - start < HOLD_MS) {
+        r = WaitForSingleObject(in, 500);
+        if (r == WAIT_TIMEOUT) {
+            continue;
+        }
+        if (r != WAIT_OBJECT_0 || !ReadConsoleInput(in, &rec, 1, &n)) {
+            return;
+        }
+        if (n == 1 && rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) {
+            return;
+        }
     }
 }
 
@@ -2064,9 +2226,17 @@ static int runConsole(void) {
     HANDLE h;
     CONSOLE_CURSOR_INFO ci;
 
-    SetConsoleCtrlHandler(onCtrl, TRUE);
+    ownConsole = consoleIsOurs();   /* first, before anything is printed */
     openLogFile();
+    if (!claimPort(rshPort)) {
+        logMsg("another ntrshd is already serving port %d (another window, or the service)", rshPort);
+        logMsg("this one will not start; a second ntrshd needs its own port: -p PORT");
+        holdWindow();
+        return 1;
+    }
+    SetConsoleCtrlHandler(onCtrl, TRUE);
     if (!beginServe()) {
+        holdWindow();
         return 1;
     }
     h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -2077,6 +2247,7 @@ static int runConsole(void) {
     showSettings();
     _beginthread(statusThread, 0, NULL);
     serve(rshPort);
+    releasePort();                 /* not listening any more: another ntrshd may start */
     drainCommands(STOP_WAIT_MS + 2000);
     statusMode = 0;
     if (!quietFlag) {
@@ -2097,6 +2268,7 @@ int main(int argc, char **argv) {
     InitializeCriticalSection(&runLock);
     InitializeCriticalSection(&portLock);
     InitializeCriticalSection(&logLock);
+    quitEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
     if (!parseArgs(argc, argv)) {
         usage();
