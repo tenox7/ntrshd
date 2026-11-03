@@ -13,8 +13,7 @@
  * once, fully independent: no shared buffers, no handles inherited from
  * one session into another, no shared console signal.
  *
- * There is no security of any kind.  Anyone who can reach the port can
- * run any command as the account that runs ntrshd.  Trusted LAN only.
+ * security: open (+ +)
  *
  * Build:  nmake
  *
@@ -2006,7 +2005,7 @@ static void showSettings(void) {
     }
     logMsg("each command runs in its own hidden process group");
     logMsg("Ctrl+C or Ctrl+Break quits; commands get a moment to stop, press again to kill now");
-    logMsg("no security: anyone who can reach this port can run commands");
+    logMsg("security: open (+ +)");
 }
 
 /* -------- console status window ----------------------------------------- */
@@ -2141,7 +2140,7 @@ static void drawStatus(void) {
     }
     line[sizeof(line) - 1] = 0;
     putLine(h, row++, w, line);
-    putLine(h, row++, w, "no security: anyone who can reach this port runs commands here");
+    putLine(h, row++, w, "security: open (+ +)");
     putLine(h, row++, w, "");
     putLine(h, row++, w, " ID   FROM             TIME    COMMAND");
     for (i = 0; i < ns; i++) {

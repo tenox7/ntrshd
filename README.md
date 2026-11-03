@@ -8,26 +8,26 @@ the `rsh` MCP server.
 One plain-C source. It builds with the **NT 3.1, 3.5 and 4.0 SDKs** and runs
 on **NT 3.1 and later**, on any CPU (x86, MIPS, Alpha, PowerPC).
 
-> **No security of any kind.** Anyone who can reach the port can run any
-> command as the account that runs ntrshd. Use it on a trusted LAN only.
+security: open (+ +)
 
 ## Build
 
 From an SDK command prompt, in this folder:
 
 ```
-nmake              (NT 3.5, NT 4.0, and the RISC SDKs)
-nmake NT31=1       (NT 3.1 only)
+nmake
 ```
 
-The same `Makefile` works on every SDK and CPU: compile and link go through
-`cl`, which calls the right linker (`link32` on NT 3.1, `link` on 3.5/4.0),
-so nothing names the linker or the architecture.
+That's all, on every SDK (NT 3.1, 3.5, 4.0) and every CPU (x86, MIPS,
+Alpha, PowerPC). The `Makefile` asks `cl` for its version and does the rest.
+Compile and link go through `cl`, which calls the right linker (`link32` on
+NT 3.1, `link` on 3.5/4.0), so nothing names the linker or the architecture.
 
 The icon and version number live in `ntrshd.rc`, which `rc` builds into
-`ntrshd.res`. NT 3.5 and 4.0 link that straight into the exe, so plain
-`nmake` works there. NT 3.1's older `link32` can't take a `.res` directly, so
-on NT 3.1 run `nmake NT31=1`, which converts the resource with `cvtres` first.
+`ntrshd.res`. NT 3.5 and 4.0 link that straight into the exe. NT 3.1's
+`link32` can't take a `.res`, so on NT 3.1 the Makefile first converts it
+with `cvtres` for the CPU in the `CPU` variable (`i386`, `MIPS` or `ALPHA`),
+which the SDK's setenv sets. Without `CPU` it assumes `i386`.
 
 - NT 3.1: Win32 SDK, `cl386` 8.00
 - NT 3.5 / 3.51: Visual C++ 2.0 (one binary runs 3.5 → 4.0)
