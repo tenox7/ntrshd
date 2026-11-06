@@ -13,6 +13,9 @@
  * once, fully independent: no shared buffers, no handles inherited from
  * one session into another, no shared console signal.
  *
+ * For rsh-mcp (github.com/tenox7/rsh-mcp) it also runs the script that
+ * rsh-mcp gives /bin/sh to get a command's exit status (see doScript).
+ *
  * security: open (+ +)
  *
  * Build:  nmake
@@ -77,10 +80,13 @@
 #define SVCAPI WINAPI
 #endif
 
-#define RSHD_VERSION "1.1"
+#define RSHD_VERSION "1.2"
 #define RSH_PORT 514
 #define FIELD_SIZE 256
 #define CMD_SIZE 4096
+#define SCRIPT_CMD "sh -s rsh-mcp-1"   /* rsh-mcp asks for this to run its script */
+#define SCRIPT_END ") </dev/null 2>&1" /* the script's line right after the command */
+#define MARK_SIZE 64
 #define LINE_SIZE 1024
 #define IO_SIZE 8192
 #define STATUS_MS 500       /* console status-window refresh interval */
@@ -137,6 +143,7 @@ typedef struct {
     char last;                 /* last byte sent to the client (for note formatting) */
     DWORD startTick;           /* when the command started, for the status window */
     char cmd[128];             /* the command line, for the status window */
+    char marker[MARK_SIZE];    /* rsh-mcp script: the output ends with this and the exit code */
 } CONN;
 
 static CRITICAL_SECTION spawnLock;  /* serialises CreateProcess + inheritable handles */
@@ -887,7 +894,11 @@ static void logExit(CONN *c, DWORD total) {
         logMsg("[%d] done, %lu bytes sent, cmd still running", c->id, total);
         return;
     }
-    if (sendExit) {
+    if (c->marker[0] != 0) {
+        char line[MARK_SIZE + 16];
+        sprintf(line, "%s%lu__\n", c->marker, code);
+        sendAll(c->sock, line, strlen(line));
+    } else if (sendExit) {
         char line[64];
         sprintf(line, "%srshd: exit code %lu\n", c->last == '\n' ? "" : "\n", code);
         sendAll(c->sock, line, strlen(line));
@@ -920,27 +931,17 @@ static void endCommand(CONN *c) {
     c->proc = NULL;
 }
 
-static void doExec(CONN *c, char *command) {
-    DWORD total;
-
-    if (!startCommand(c, command)) {
-        sendErr(c, "rshd: cannot start %s, error %lu", comspec != NULL ? comspec : "cmd", GetLastError());
-        return;
-    }
+/* the command has started: show it in the status window and the quit list */
+static void addCommand(CONN *c, char *command) {
     _snprintf(c->cmd, sizeof(c->cmd) - 1, "%s", command);
     c->cmd[sizeof(c->cmd) - 1] = 0;
     c->startTick = GetTickCount();
     addRunning(c);
-    if (!sendByte(c->sock, 0)) {
-        logMsg("[%d] client went away before the output started", c->id);
-        stopCommand(c, STOP_GONE);
-        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, c->pid);
-        WaitForSingleObject(c->proc, STOP_WAIT_MS);
-        TerminateProcess(c->proc, CONTROL_C_EXIT);
-        endCommand(c);
-        return;
-    }
-    c->started = 1;
+}
+
+/* the command runs and the client has its status byte: serve it to the end */
+static void serveCommand(CONN *c) {
+    DWORD total;
 
     c->monitorDone = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (c->monitorDone == NULL || _beginthread(monitorThread, 0, c) == (unsigned long)-1L) {
@@ -963,6 +964,211 @@ static void doExec(CONN *c, char *command) {
     }
     logExit(c, total);
     endCommand(c);
+}
+
+static void doExec(CONN *c, char *command) {
+    if (!startCommand(c, command)) {
+        sendErr(c, "rshd: cannot start %s, error %lu", comspec != NULL ? comspec : "cmd", GetLastError());
+        return;
+    }
+    addCommand(c, command);
+    if (!sendByte(c->sock, 0)) {
+        logMsg("[%d] client went away before the output started", c->id);
+        stopCommand(c, STOP_GONE);
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, c->pid);
+        WaitForSingleObject(c->proc, STOP_WAIT_MS);
+        TerminateProcess(c->proc, CONTROL_C_EXIT);
+        endCommand(c);
+        return;
+    }
+    c->started = 1;
+    serveCommand(c);
+}
+
+/* -------- rsh-mcp scripts ------------------------------------------------ */
+
+/*
+ * rsh-mcp gets a command's exit status from a Unix host by asking for
+ * SCRIPT_CMD and writing this script to its stdin:
+ *
+ *     shift
+ *     (
+ *     the command, one line or more
+ *     ) </dev/null 2>&1
+ *     echo MARKER$?__
+ *     exit
+ *
+ * NT has no sh, so ntrshd reads the script itself.  It joins the command's
+ * lines with & into one command line, as if they were typed on one line
+ * (no spaces around &, so "set X=1" sets "1", not "1 "), runs that with
+ * cmd /c and no stdin, and ends the output with MARKER<exit code>__ as the
+ * echo line would.  rsh-mcp sends the script only after the status byte,
+ * so that byte goes first here, and a problem after it is reported as
+ * text.
+ */
+
+static void trimCr(char *s) {
+    int len;
+
+    len = strlen(s);
+    if (len > 0 && s[len - 1] == '\r') {
+        s[len - 1] = 0;
+    }
+}
+
+static int isBlank(char *s, int len) {
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (s[i] != ' ' && s[i] != '\t') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* the start of the last line before end (each line ends in \n), or NULL */
+static char *lastLine(char *text, char *end) {
+    char *p;
+
+    if (end <= text) {
+        return NULL;
+    }
+    p = end - 1;
+    while (p > text && p[-1] != '\n') {
+        p--;
+    }
+    return p;
+}
+
+/* if the last two lines of body are SCRIPT_END and "echo MARKER$?__", keeps
+   MARKER, cuts both lines off and returns 1 */
+static int scriptEnds(CONN *c, char *body, char *end) {
+    char *echoLine;
+    char *endLine;
+    int endLen;
+    int len;
+
+    echoLine = lastLine(body, end);
+    endLine = (echoLine != NULL) ? lastLine(body, echoLine) : NULL;
+    if (endLine == NULL) {
+        return 0;
+    }
+    endLen = strlen(SCRIPT_END);
+    if (echoLine - endLine != endLen + 1 || strncmp(endLine, SCRIPT_END, endLen) != 0) {
+        return 0;
+    }
+    len = (int)(end - echoLine) - 1;    /* the echo line without its \n */
+    if (len <= 9 || len - 9 >= MARK_SIZE) {
+        return 0;
+    }
+    if (strncmp(echoLine, "echo ", 5) != 0 || strncmp(echoLine + len - 4, "$?__", 4) != 0) {
+        return 0;
+    }
+    memcpy(c->marker, echoLine + 5, len - 9);
+    c->marker[len - 9] = 0;
+    *endLine = 0;
+    return 1;
+}
+
+/* reads the script: the command's lines into body, each ending in \n, and
+   the marker into c->marker; 0 if it does not arrive whole or does not fit */
+static int readScript(CONN *c, char *body, int size) {
+    char line[CMD_SIZE];
+    int used;
+    int len;
+    int n;
+
+    for (n = 0; ; n++) {
+        if (n == 4 || readUntil(c->sock, line, sizeof(line), '\n') < 0) {
+            return 0;
+        }
+        trimCr(line);
+        if (strcmp(line, "(") == 0) {
+            break;
+        }
+    }
+    used = 0;
+    body[0] = 0;
+    for (;;) {
+        if (readUntil(c->sock, line, sizeof(line), '\n') < 0) {
+            return 0;
+        }
+        trimCr(line);
+        if (strcmp(line, "exit") == 0 && scriptEnds(c, body, body + used)) {
+            return 1;
+        }
+        len = strlen(line);
+        if (used + len + 2 > size) {
+            return 0;
+        }
+        memcpy(body + used, line, len);
+        used += len;
+        body[used++] = '\n';
+        body[used] = 0;
+    }
+}
+
+/* joins the lines of body with & into one command line, leaving out blank
+   ones; 0 if nothing is left or it does not fit */
+static int joinLines(char *body, char *command, int size) {
+    char *line;
+    char *next;
+    int used;
+    int len;
+
+    used = 0;
+    command[0] = 0;
+    for (line = body; *line != 0; line = next + 1) {
+        next = strchr(line, '\n');
+        len = (int)(next - line);
+        if (isBlank(line, len)) {
+            continue;
+        }
+        if (used + len + 2 > size) {
+            return 0;
+        }
+        if (used > 0) {
+            command[used++] = '&';
+        }
+        memcpy(command + used, line, len);
+        used += len;
+        command[used] = 0;
+    }
+    return used > 0;
+}
+
+static void doScript(CONN *c) {
+    char body[CMD_SIZE];
+    char command[CMD_SIZE];
+    char text[LINE_SIZE];
+
+    if (!sendByte(c->sock, 0)) {
+        logMsg("[%d] client went away before its script came", c->id);
+        return;
+    }
+    c->started = 1;
+    if (!readScript(c, body, sizeof(body))) {
+        logMsg("[%d] the rsh-mcp script did not arrive whole, or is too long", c->id);
+        sendNote(c, "the rsh-mcp script did not arrive whole, or is too long");
+        return;
+    }
+    if (!joinLines(body, command, sizeof(command))) {
+        logMsg("[%d] the rsh-mcp script has no command, or it is too long", c->id);
+        sendNote(c, "the rsh-mcp script has no command, or it is too long");
+        return;
+    }
+    logMsg("[%d] rsh-mcp script: %s", c->id, command);
+    if (!startCommand(c, command)) {
+        sprintf(text, "cannot start %s, error %lu", comspec != NULL ? comspec : "cmd", GetLastError());
+        logMsg("[%d] %s", c->id, text);
+        sendNote(c, text);
+        return;
+    }
+    CloseHandle(c->inPipe);   /* the script was the input: the command gets none */
+    c->inPipe = NULL;
+    addCommand(c, command);
+    serveCommand(c);
 }
 
 /* -------- rcp ------------------------------------------------------------ */
@@ -1283,6 +1489,10 @@ static void handleConn(CONN *c) {
     logMsg("[%d] %s@%s: %s", c->id, localUser, c->ip, command);
     if (command[0] == 0) {
         sendErr(c, "rshd: no command");
+        return;
+    }
+    if (strcmp(command, SCRIPT_CMD) == 0) {
+        doScript(c);
         return;
     }
     if (!doRcp(c, command)) {

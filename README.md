@@ -90,6 +90,17 @@ system error 1056.
   means stderr comes back with stdout), client user, server user, command,
   then the status byte.
 - **Commands** run as `cmd /c <command>`, exactly as sent — no rewriting.
+  The one exception is the rsh-mcp script, below.
+- **rsh-mcp gets the exit status.** To learn a command's exit status from
+  a Unix host, the [rsh-mcp](https://github.com/tenox7/rsh-mcp) server asks
+  for `sh -s rsh-mcp-1` and writes a short script to it, with the command
+  inside. NT has no `sh`, so ntrshd reads that script itself: it runs the
+  command with `cmd /c` and no stdin, and ends the output with the exit
+  code the way the script would. Several lines become one command line,
+  joined with `&`, as if typed on one line.
+  So rsh-mcp's `exec` works on NT as on Unix, with no options, and `-e` is
+  not needed for it. Any other command, plain `sh` included, runs as
+  before.
 - **Many sessions at once**, each in its own thread and its own hidden
   process group, so one session cannot disturb another.
 - **All output is delivered** before the connection closes, byte for byte
@@ -147,8 +158,8 @@ re-established there.
 ## Status
 
 Builds clean under the NT 3.1, 3.5 and 4.0 SDKs, and passes functional tests
-(rsh, rcp handshake, stderr channel and signal, half-close, empty command)
-under Wine.
+(rsh, rcp handshake, stderr channel and signal, half-close, empty command,
+rsh-mcp scripts) under Wine.
 
 Validated on a **real NT 4.0 MIPS machine** (RM300, 4-way R4400): single
 commands, 8 simultaneous sessions, ~800-line output delivered complete,
