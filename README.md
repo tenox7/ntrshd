@@ -190,8 +190,9 @@ re-established there.
 
 ## Tested
 
-Version 1.3, all 11 release exes, each on its own NT version (in LEMU, QEMU
-for these machines):
+Version 1.3.1, all 11 release exes, each on its own NT version (in LEMU, QEMU
+for these machines). Each one was installed as a service with
+`ntrshd -install`, started with `net start ntrshd`, and tested there:
 
 | CPU | NT 3.1 | NT 3.51 | NT 4.0 |
 |---|---|---|---|
@@ -202,9 +203,11 @@ for these machines):
 
 Each run: a command; the exit status through an rsh-mcp script; `Ctrl+Break`
 from the client; a client reset; 200 KB through stdin, returned exactly; 4
-sessions at once.
+sessions at once. On NT 3.1 MIPS and Alpha, also installed with an option
+(`ntrshd -install -p 2514`).
 
-More on some of them:
+Version 1.3, the same code apart from `-install`, also ran these, in a
+console window:
 
 - NT 4.0 Alpha: 2000 sessions, 8 at a time, while one 5-minute command
   ran. Every session ended with its full output, no connect was refused,

@@ -83,7 +83,7 @@
 #define SVCAPI WINAPI
 #endif
 
-#define RSHD_VERSION "1.3"
+#define RSHD_VERSION "1.3.1"
 #define RSH_PORT 514
 #define FIELD_SIZE 256
 #define CMD_SIZE 4096
@@ -2410,7 +2410,13 @@ static void doInstall(char *user, char *password, char *extra) {
         }
         printf("copied exe to %s\n", binPath);
     }
-    sprintf(image, "\"%s\"%s", binPath, extra);
+    /* NT 3.1's service controller cannot start a quoted path ("net start"
+       fails with system error 2), so quote it only when it has a space */
+    if (strchr(binPath, ' ') != NULL) {
+        sprintf(image, "\"%s\"%s", binPath, extra);
+    } else {
+        sprintf(image, "%s%s", binPath, extra);
+    }
     scm = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (scm == NULL) {
         printf("OpenSCManager failed, error %lu (need administrator rights)\n", GetLastError());

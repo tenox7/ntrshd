@@ -7,8 +7,8 @@
 1 ICON "ntrshd.ico"
 
 VS_VERSION_INFO VERSIONINFO
-    FILEVERSION    1,3,0,0
-    PRODUCTVERSION 1,3,0,0
+    FILEVERSION    1,3,1,0
+    PRODUCTVERSION 1,3,1,0
     FILEOS         VOS_NT_WINDOWS32
     FILETYPE       VFT_APP
 {
@@ -18,11 +18,11 @@ VS_VERSION_INFO VERSIONINFO
         {
             VALUE "CompanyName",      "github.com/tenox7/ntrshd\0"
             VALUE "FileDescription",  "RSH/RCP daemon for Windows NT\0"
-            VALUE "FileVersion",      "1.3\0"
+            VALUE "FileVersion",      "1.3.1\0"
             VALUE "LegalCopyright",   "tenox\0"
             VALUE "OriginalFilename", "ntrshd.exe\0"
             VALUE "ProductName",      "ntrshd - RSH daemon for Windows NT\0"
-            VALUE "ProductVersion",   "1.3\0"
+            VALUE "ProductVersion",   "1.3.1\0"
         }
     }
     BLOCK "VarFileInfo"
