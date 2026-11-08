@@ -8,10 +8,11 @@
  *
  * It speaks the BSD rsh protocol: optional stderr port, client user,
  * server user, command, then a status byte.  Each command runs as
- * "cmd /c <command>" in its own hidden process group, with stdout and
- * (optionally) stderr piped back to the client.  Many sessions run at
- * once, fully independent: no shared buffers, no handles inherited from
- * one session into another, no shared console signal.
+ * "cmd /c <command>" in a hidden console of its own, under a small
+ * helper (ntrshd itself, started as "ntrshd -session": see runHelper),
+ * with stdout and (optionally) stderr piped back to the client.  Many
+ * sessions run at once, fully independent: no shared buffers, no handles
+ * inherited from one session into another, no shared console.
  *
  * For rsh-mcp (github.com/tenox7/rsh-mcp) it also runs the script that
  * rsh-mcp gives /bin/sh to get a command's exit status (see doScript).
@@ -45,6 +46,15 @@
 # define WIN32
 #endif
 
+/*
+ * ntrshd always links the multithreaded C library (libcmt).  /MT tells the
+ * headers so, but the NT 3.1 Alpha compiler ignores /MT, and without _MT the
+ * NT 3.1 headers leave out _beginthread and the thread-safe errno.
+ */
+#ifndef _MT
+# define _MT 1
+#endif
+
 #include <windows.h>
 #include <winsock.h>
 #include <stdio.h>
@@ -54,20 +64,13 @@
 #include <process.h>
 
 /*
- * Build-time target detection.  The SAME source picks the right APIs for
- * each SDK, keyed off the compiler version:
+ * Build-time target detection.  The SAME source builds with each SDK; the
+ * few differences are keyed off the compiler version:
  *   _MSC_VER  800  = NT 3.1 SDK   (cl386 8.00)
  *   _MSC_VER  900  = Visual C++ 2.0 (NT 3.5)
  *   _MSC_VER 1000+ = Visual C++ 4.x (NT 4.0 and later)
- * SetHandleInformation exists on NT 3.51+, so only the NT 4.0 build uses
- * it to make sockets non-inheritable.  Older builds get "lesser" handling
- * (a graceful shutdown still sends FIN even if a sibling inherited a copy).
+ * It uses no API newer than NT 3.1, so every build runs on every NT.
  */
-#if defined(_MSC_VER) && _MSC_VER >= 1000
-#define HAVE_SETHANDLEINFO 1
-#else
-#define HAVE_SETHANDLEINFO 0
-#endif
 
 /*
  * The NT 3.1 winsvc.h declares the service main and control callbacks with
@@ -80,7 +83,7 @@
 #define SVCAPI WINAPI
 #endif
 
-#define RSHD_VERSION "1.2"
+#define RSHD_VERSION "1.3"
 #define RSH_PORT 514
 #define FIELD_SIZE 256
 #define CMD_SIZE 4096
@@ -89,22 +92,28 @@
 #define MARK_SIZE 64
 #define LINE_SIZE 1024
 #define IO_SIZE 8192
+#define EXTRA_SIZE 512         /* options after -install, passed on to the service */
 #define STATUS_MS 500       /* console status-window refresh interval */
 #define NO_ATTRS ((DWORD)0xFFFFFFFF)
-#define IO_SECONDS 60          /* handshake / rcp read timeout */
+#define IO_SECONDS 60          /* request / script / rcp read timeout */
 #define RETRY_SECONDS 10
 #define PROBE_SECONDS 3
-#define POLL_MS 50
+#define MONITOR_MS 200         /* the input thread looks for the session's end this often */
 #define STOP_WAIT_MS 5000      /* grace after CTRL_BREAK before TerminateProcess */
+#define KILL_EXTRA_MS 2000     /* a stop this late: tell the helper to kill, then end it */
+#define READY_MS 60000         /* the session helper must start the command within this */
+#define CANCEL_MS 5000         /* a cancelled pipe read or write ends within this */
 #define GRAND_GRACE_MS 3000    /* after cmd exits, wait this for a grandchild's output */
 #define NOTE_MS 60000
-#define DRAIN_MS 1000          /* graceful close: read client out for up to this */
+#define DRAIN_MS 1000          /* graceful close: wait this long for the client to close too */
+#define CLOSE_MS 10000         /* ... and never longer than this in all */
 #define MAX_RUNNING 128
 #define LISTEN_BACKLOG 200     /* winsock.h SOMAXCONN is only 5; NT Server honours up to 200 */
 #define ACCEPT_FAILS 10
 #define CLAIM_WAIT_MS 2000     /* wait this long for another ntrshd to let go of the port */
 #define CLOSE_WAIT_MS 2000     /* window closed: give the sessions this long to finish */
 #define HOLD_MS 60000          /* a startup error stays on a double-clicked window this long */
+#define HELPER_FAIL 0x20000000L /* a session helper's exit code: it could not set up */
 
 /* service identity */
 #define SVC_NAME "ntrshd"
@@ -117,11 +126,31 @@
 #define STOP_GONE 3
 #define STOP_SHUTDOWN 4
 
+/* how a command's output ended, for the log */
+#define END_EOF 0              /* the command closed its output: it exited */
+#define END_HELD 1             /* it exited, but a program it started still held the output */
+#define END_STOPPED 2          /* it was stopped (see stopWhy) */
+
 /* the listening port, as the status window shows it */
 #define PORT_OPENING 0
 #define PORT_LISTENING 1
 #define PORT_TAKEN 2           /* another program answers on the port */
 #define PORT_FAILED 3          /* bind or listen failed with portError */
+
+/*
+ * ntrshd's end of one of a command's pipes (see makePipe).  The buffer and
+ * the OVERLAPPED live here, not on a stack, because a read or write in
+ * flight uses them until it ends.
+ */
+typedef struct {
+    HANDLE pipe;               /* overlapped named pipe end, or NULL when closed */
+    OVERLAPPED ov;             /* ov.hEvent is set when a read or write ends */
+    int pending;               /* a ReadFile or WriteFile is in flight */
+    int eof;                   /* output: the command closed its end */
+    DWORD len;                 /* stdin: bytes in buf */
+    DWORD off;                 /* stdin: bytes of buf already written */
+    char buf[IO_SIZE];
+} PIPE;
 
 typedef struct {
     SOCKET sock;               /* main channel: stdout to client, stdin from client */
@@ -129,30 +158,43 @@ typedef struct {
     struct sockaddr_in peer;
     char ip[16];
     int id;
-    HANDLE proc;               /* child cmd.exe process */
-    DWORD pid;                 /* == process group id (CREATE_NEW_PROCESS_GROUP) */
-    HANDLE outPipe;            /* rshd reads child stdout here */
-    HANDLE errPipe;            /* rshd reads child stderr here (separate channel), or NULL */
-    HANDLE inPipe;             /* rshd writes child stdin here, or NULL */
-    HANDLE monitorDone;        /* signalled when the monitor thread has exited */
-    int stopWhy;
-    int done;                  /* tells the monitor thread to stop */
+    HANDLE proc;               /* the session helper process (see runHelper) */
+    DWORD pid;                 /* the helper's process id */
+    DWORD cmdPid;              /* the command's (cmd.exe) process id */
+    HANDLE stopEv;             /* tells the helper: CTRL_BREAK, then kill after a grace period */
+    HANDLE killEv;             /* tells the helper: kill now */
+    HANDLE wake;               /* wakes the session thread: a stop was asked for */
+    HANDLE monitorDone;        /* signalled when the input thread has exited */
+    PIPE out;                  /* the command's stdout (and stderr, with no separate channel) */
+    PIPE err;                  /* the command's stderr, for the separate channel */
+    PIPE in;                   /* the command's stdin */
+    volatile int stopWhy;      /* STOP_xxx: why the command should stop */
+    volatile int killNow;      /* stop it without the grace period */
+    volatile int done;         /* tells the input thread to stop */
+    int endWhy;                /* END_xxx, for the log */
     int sockWatch;             /* still worth watching sock for input/disconnect */
     int errWatch;              /* still worth watching errSock for a signal byte */
     int started;               /* the status byte was sent; output has begun */
+    int slot;                  /* index in running[], or -1 */
+    int limited;               /* the reads share one IO_SECONDS limit (request, script) */
+    int leak;                  /* a cancelled pipe read or write never ended: never free */
     char last;                 /* last byte sent to the client (for note formatting) */
+    DWORD limitStart;          /* when the limited reads began */
     DWORD startTick;           /* when the command started, for the status window */
+    DWORD finTick;             /* when the FIN went out, for the log */
+    DWORD inBytes;             /* stdin bytes from the client */
     char cmd[128];             /* the command line, for the status window */
     char marker[MARK_SIZE];    /* rsh-mcp script: the output ends with this and the exit code */
 } CONN;
 
-static CRITICAL_SECTION spawnLock;  /* serialises CreateProcess + inheritable handles */
 static CRITICAL_SECTION runLock;    /* guards running[] */
-static CRITICAL_SECTION portLock;   /* guards nextErrPort */
+static CRITICAL_SECTION portLock;   /* guards nextErrPort and pipeSerial */
 static CRITICAL_SECTION logLock;    /* guards log output */
 static CONN *running[MAX_RUNNING];
 static SOCKET listener = INVALID_SOCKET;
 static char *comspec;
+static char selfPath[MAX_PATH];     /* this exe: it is each command's session helper too */
+static DWORD pipeSerial = 0;        /* numbers the pipes, for unique names */
 static int nextErrPort = IPPORT_RESERVED - 1;
 static int connCount = 0;
 static int statusMode = 0;          /* console shows the live status window */
@@ -160,7 +202,7 @@ static int quietFlag = 0;           /* -q: plain scrolling log, no status window
 static DWORD upSince = 0;           /* when serving began, for the uptime line */
 static char hostLabel[80] = "";     /* this host's name, for the status header */
 static char ipLabel[96] = "";       /* this host's IP address(es), for the header */
-static int debugFlag = 0;           /* extra per-event detail */
+static int debugFlag = 0;           /* -d: one log line per event, times in ms */
 static int sendExit = 0;            /* send the exit code as a last line */
 static DWORD idleLimit = 0;         /* stop a silent command after this long; 0 = never */
 static DWORD grandGrace = GRAND_GRACE_MS;
@@ -179,27 +221,49 @@ static SERVICE_STATUS_HANDLE svcStatusHandle = 0;
 
 /* -------- logging -------------------------------------------------------- */
 
-static void logMsg(const char *fmt, ...) {
+static void logLine(const char *fmt, va_list ap) {
     char msg[LINE_SIZE];
+    char ms[8];
     SYSTEMTIME now;
-    va_list ap;
 
-    va_start(ap, fmt);
     _vsnprintf(msg, sizeof(msg) - 1, fmt, ap);
-    va_end(ap);
     msg[sizeof(msg) - 1] = 0;
     GetLocalTime(&now);
+    ms[0] = 0;
+    if (debugFlag) {
+        sprintf(ms, ".%03d", now.wMilliseconds);
+    }
     EnterCriticalSection(&logLock);
     if (!asService && !statusMode) {
-        printf("%02d:%02d:%02d %s\n", now.wHour, now.wMinute, now.wSecond, msg);
+        printf("%02d:%02d:%02d%s %s\n", now.wHour, now.wMinute, now.wSecond, ms, msg);
         fflush(stdout);
     }
     if (logFile != NULL) {
-        fprintf(logFile, "%04d-%02d-%02d %02d:%02d:%02d %s\n", now.wYear, now.wMonth,
-                now.wDay, now.wHour, now.wMinute, now.wSecond, msg);
+        fprintf(logFile, "%04d-%02d-%02d %02d:%02d:%02d%s %s\n", now.wYear, now.wMonth,
+                now.wDay, now.wHour, now.wMinute, now.wSecond, ms, msg);
         fflush(logFile);
     }
     LeaveCriticalSection(&logLock);
+}
+
+static void logMsg(const char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    logLine(fmt, ap);
+    va_end(ap);
+}
+
+/* -d: more detail, one line per event */
+static void logDebug(const char *fmt, ...) {
+    va_list ap;
+
+    if (!debugFlag) {
+        return;
+    }
+    va_start(ap, fmt);
+    logLine(fmt, ap);
+    va_end(ap);
 }
 
 /* -------- socket helpers ------------------------------------------------- */
@@ -237,31 +301,49 @@ static void sendErr(CONN *c, const char *fmt, ...) {
     sendAll(c->sock, msg, strlen(msg));
 }
 
-/* waits at most IO_SECONDS for the client, so a client that stops talking
-   cannot hold a connection forever */
-static int recvWait(SOCKET s, char *buf, int len) {
+/* waits for the client at most IO_SECONDS.  While the request or the
+   rsh-mcp script is read (c->limited), all of those reads together get
+   IO_SECONDS, so a client that stops talking, or sends a byte a minute,
+   cannot hold a connection for long. */
+static int recvWait(CONN *c, char *buf, int len) {
     struct timeval tv;
     fd_set fds;
+    DWORD ms;
+    DWORD used;
 
+    ms = IO_SECONDS * 1000;
+    if (c->limited) {
+        used = GetTickCount() - c->limitStart;
+        if (used >= ms) {
+            return -1;
+        }
+        ms -= used;
+    }
     FD_ZERO(&fds);
-    FD_SET(s, &fds);
-    tv.tv_sec = IO_SECONDS;
-    tv.tv_usec = 0;
+    FD_SET(c->sock, &fds);
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
     if (select(0, &fds, NULL, NULL, &tv) != 1) {
         return -1;
     }
-    return recv(s, buf, len, 0);
+    return recv(c->sock, buf, len, 0);
+}
+
+/* starts (on) or ends the shared time limit for the reads that follow */
+static void limitReads(CONN *c, int on) {
+    c->limited = on;
+    c->limitStart = GetTickCount();
 }
 
 /* reads up to the end character, which is dropped; fails when the connection
-   closes or the text does not fit */
-static int readUntil(SOCKET s, char *buf, int size, char end) {
+   closes, the time is up or the text does not fit */
+static int readUntil(CONN *c, char *buf, int size, char end) {
     int len;
     char ch;
 
     len = 0;
     for (;;) {
-        if (recvWait(s, &ch, 1) != 1) {
+        if (recvWait(c, &ch, 1) != 1) {
             return -1;
         }
         if (ch == end) {
@@ -282,27 +364,17 @@ static int readResponse(CONN *c) {
     char msg[LINE_SIZE];
     char ch;
 
-    if (recvWait(c->sock, &ch, 1) != 1) {
+    if (recvWait(c, &ch, 1) != 1) {
         return -1;
     }
     if (ch == 0) {
         return 0;
     }
-    if (readUntil(c->sock, msg, sizeof(msg), '\n') < 0) {
+    if (readUntil(c, msg, sizeof(msg), '\n') < 0) {
         msg[0] = 0;
     }
     logMsg("[%d] client error: %s", c->id, msg);
     return ch;
-}
-
-/* makes a socket non-inheritable where the platform allows it, so a child
-   of one session can never inherit another session's socket */
-static void noInheritSock(SOCKET s) {
-#if HAVE_SETHANDLEINFO
-    SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
-#else
-    (void)s;   /* NT 3.1/3.5: handled by the graceful shutdown in closeConn */
-#endif
 }
 
 static int nextReservedPort(void) {
@@ -335,7 +407,6 @@ static SOCKET connectBack(CONN *c, int port) {
         logMsg("[%d] stderr channel: socket failed, error %d", c->id, WSAGetLastError());
         return INVALID_SOCKET;
     }
-    noInheritSock(s);
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -362,27 +433,48 @@ static SOCKET connectBack(CONN *c, int port) {
     return s;
 }
 
-/* sends the FIN with shutdown, then lets the client finish reading before
-   closing, so nothing still queued is lost (never an abortive RST) */
-static void closeConn(SOCKET s) {
+/* the first half of a graceful close: the FIN goes out at once, so the
+   client sees the end of the output without waiting for anything else */
+static void sendFin(SOCKET s) {
+    if (s != INVALID_SOCKET) {
+        shutdown(s, 1);   /* SD_SEND: send FIN, keep reading */
+    }
+}
+
+/* the second half: read what the client still sends until it closes too
+   (or stays quiet for DRAIN_MS, or CLOSE_MS have passed), then close.
+   Closing with unread data would send a reset (RST), and a reset can throw
+   away output the client has not read yet. */
+static void closeConn(CONN *c, SOCKET s, const char *name) {
     struct timeval tv;
     fd_set fds;
     char buf[256];
-    int i;
+    int n;
 
     if (s == INVALID_SOCKET) {
         return;
     }
-    shutdown(s, 1);   /* SD_SEND: send FIN, keep reading */
-    for (i = 0; i < 64; i++) {
+    shutdown(s, 1);
+    for (;;) {
         FD_ZERO(&fds);
         FD_SET(s, &fds);
         tv.tv_sec = DRAIN_MS / 1000;
         tv.tv_usec = (DRAIN_MS % 1000) * 1000;
         if (select(0, &fds, NULL, NULL, &tv) != 1) {
+            logDebug("[%d] %s: the client did not close it, closing", c->id, name);
             break;
         }
-        if (recv(s, buf, sizeof(buf), 0) <= 0) {
+        n = recv(s, buf, sizeof(buf), 0);
+        if (n == 0) {
+            logDebug("[%d] %s: the client closed it %lu ms after the FIN", c->id, name, GetTickCount() - c->finTick);
+            break;
+        }
+        if (n < 0) {
+            logDebug("[%d] %s: the client reset it %lu ms after the FIN", c->id, name, GetTickCount() - c->finTick);
+            break;
+        }
+        if (GetTickCount() - c->finTick >= CLOSE_MS) {
+            logDebug("[%d] %s: the client keeps sending, closing", c->id, name);
             break;
         }
     }
@@ -440,32 +532,7 @@ static void joinPath(char *out, char *dir, char *name) {
     strcat(out, name);
 }
 
-/* -------- process handle helpers ----------------------------------------- */
-
-/* an inheritable duplicate of h, made only for the moment of CreateProcess */
-static HANDLE inheritable(HANDLE h) {
-    HANDLE dup;
-
-    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &dup, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
-        return NULL;
-    }
-    return dup;
-}
-
-static HANDLE openNul(void) {
-    SECURITY_ATTRIBUTES sa;
-    HANDLE h;
-
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-    h = CreateFile("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                   &sa, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        return NULL;
-    }
-    return h;
-}
+/* -------- the command's pipes -------------------------------------------- */
 
 static void dropHandle(HANDLE h) {
     if (h != NULL) {
@@ -474,137 +541,247 @@ static void dropHandle(HANDLE h) {
 }
 
 /*
- * Starts "cmd /c command".
- *
- *  - stdout (and stderr, if no separate channel) go to one pipe we read;
- *    a separate stderr channel gets its own pipe.
- *  - stdin is a pipe we write (the client's input), so interactive and BSD
- *    clients work; commands that ignore stdin are unaffected.
- *  - The child gets its own process group (CREATE_NEW_PROCESS_GROUP), so a
- *    Ctrl+C in rshd's window or another session cannot reach it, and rshd
- *    can stop just this command with GenerateConsoleCtrlEvent.
- *  - All pipe ends are created non-inheritable; only the child's three ends
- *    are made inheritable, inside spawnLock, and closed right after, so no
- *    other session's CreateProcess can inherit them.
+ * Makes one of a command's pipes.  ntrshd's end is a named pipe opened for
+ * overlapped I/O, so a read or write never blocks a thread: it is waited
+ * for together with other events, and closing the handle cancels it (NT
+ * before 4.0 has no CancelIo).  The command's end, *theirs, is a plain
+ * handle with the access an anonymous pipe's end has.  toCommand: ntrshd
+ * writes and the command reads (stdin); else the command writes (stdout,
+ * stderr).  Nothing is inheritable: the session helper copies the
+ * command's end out of ntrshd (see runHelper).  What is made before a
+ * failure is freed by endCommand.
  */
-static BOOL startCommand(CONN *c, char *command) {
-    char cmdLine[CMD_SIZE + 32];
+static int makePipe(PIPE *p, HANDLE *theirs, int toCommand) {
+    char name[64];
+    DWORD serial;
+    HANDLE h;
+
+    EnterCriticalSection(&portLock);
+    serial = ++pipeSerial;
+    LeaveCriticalSection(&portLock);
+    sprintf(name, "\\\\.\\pipe\\ntrshd-%lu-%lu", GetCurrentProcessId(), serial);
+    p->ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (p->ov.hEvent == NULL) {
+        return 0;
+    }
+    h = CreateNamedPipe(name, (toCommand ? PIPE_ACCESS_OUTBOUND : PIPE_ACCESS_INBOUND) | FILE_FLAG_OVERLAPPED,
+                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, IO_SIZE, IO_SIZE, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    p->pipe = h;
+    h = CreateFile(name, toCommand ? (GENERIC_READ | FILE_WRITE_ATTRIBUTES) : (GENERIC_WRITE | FILE_READ_ATTRIBUTES),
+                   0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    *theirs = h;
+    return 1;
+}
+
+static int isOpen(PIPE *p) {
+    return p->pipe != NULL && !p->eof;
+}
+
+/* closes ntrshd's end of a pipe.  A read or write still in flight is
+   cancelled by the close and ends at once; wait for that, since it writes
+   into p->buf and p->ov.  0 if it did not end (never seen). */
+static int closePipe(PIPE *p) {
+    int ok;
+
+    ok = 1;
+    if (p->pipe != NULL) {
+        CloseHandle(p->pipe);
+        p->pipe = NULL;
+    }
+    if (p->pending) {
+        ok = WaitForSingleObject(p->ov.hEvent, CANCEL_MS) == WAIT_OBJECT_0;
+        p->pending = 0;
+    }
+    p->eof = 1;
+    return ok;
+}
+
+static int freePipe(PIPE *p) {
+    if (!closePipe(p)) {
+        return 0;               /* keep the event: the read or write may still set it */
+    }
+    if (p->ov.hEvent != NULL) {
+        CloseHandle(p->ov.hEvent);
+        p->ov.hEvent = NULL;
+    }
+    return 1;
+}
+
+/* takes what the command wrote: returns how many bytes are now in p->buf,
+   0 while a read waits, -1 at end-of-file (or when the pipe is closed) */
+static int readPipe(PIPE *p) {
+    DWORD n;
+
+    for (;;) {
+        if (!isOpen(p)) {
+            return -1;
+        }
+        if (p->pending) {
+            if (WaitForSingleObject(p->ov.hEvent, 0) != WAIT_OBJECT_0) {
+                return 0;
+            }
+            p->pending = 0;
+            if (!GetOverlappedResult(p->pipe, &p->ov, &n, FALSE)) {
+                p->eof = 1;     /* ERROR_BROKEN_PIPE: every writer has closed it */
+                return -1;
+            }
+        } else if (!ReadFile(p->pipe, p->buf, IO_SIZE, &n, &p->ov)) {
+            if (GetLastError() == ERROR_IO_PENDING) {
+                p->pending = 1;
+                return 0;
+            }
+            p->eof = 1;
+            return -1;
+        }
+        if (n > 0) {
+            return (int)n;
+        }
+        /* the command wrote zero bytes: read again */
+    }
+}
+
+/* -------- starting a command --------------------------------------------- */
+
+/*
+ * Starts "cmd /c command" under a session helper (see runHelper) and waits
+ * until the command runs.  The helper starts with nothing inherited and
+ * copies what it needs out of ntrshd: the command's ends of the pipes, the
+ * stop and kill events and the ready semaphore.  Once the command runs,
+ * the helper releases the semaphore by the command's process id.  On
+ * failure why says what went wrong; what was made is freed by endCommand.
+ */
+static BOOL startCommand(CONN *c, char *command, char *why, int whySize) {
     STARTUPINFO si;
     PROCESS_INFORMATION pi;
-    HANDLE outRead, outWrite;
-    HANDLE errRead, errWrite;
-    HANDLE inRead, inWrite;
-    HANDLE childIn, childOut, childErr;
-    BOOL sep;
+    HANDLE inEnd, outEnd, errEnd;
+    HANDLE ready;
+    HANDLE waits[2];
+    const char *shell;
+    const char *q;
+    char *line;
+    DWORD code;
+    DWORD r;
+    LONG before;
     BOOL ok;
-    DWORD err;
+    int sep;
 
-    sep = (c->errSock != INVALID_SOCKET);
-    outRead = outWrite = NULL;
-    errRead = errWrite = NULL;
-    inRead = inWrite = NULL;
-    childIn = childOut = childErr = NULL;
-
-    if (!CreatePipe(&outRead, &outWrite, NULL, 0)) {
-        return FALSE;
-    }
-    if (!CreatePipe(&inRead, &inWrite, NULL, 0)) {
-        CloseHandle(outRead);
-        CloseHandle(outWrite);
-        return FALSE;
-    }
-    if (sep && !CreatePipe(&errRead, &errWrite, NULL, 0)) {
-        CloseHandle(outRead);
-        CloseHandle(outWrite);
-        CloseHandle(inRead);
-        CloseHandle(inWrite);
-        return FALSE;
-    }
-
-    sprintf(cmdLine, "%s /c %s", comspec != NULL ? comspec : "cmd", command);
-
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    EnterCriticalSection(&spawnLock);
-    childIn = inheritable(inRead);
-    childOut = inheritable(outWrite);
-    childErr = sep ? inheritable(errWrite) : inheritable(outWrite);
-    if (childIn != NULL && childOut != NULL && childErr != NULL) {
-        si.hStdInput = childIn;
-        si.hStdOutput = childOut;
-        si.hStdError = childErr;
-        ok = CreateProcess(comspec, cmdLine, NULL, NULL, TRUE,
-                           CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
-        err = GetLastError();
-    } else {
-        ok = FALSE;
-        err = GetLastError();
-    }
-    dropHandle(childIn);
-    dropHandle(childOut);
-    dropHandle(childErr);
-    LeaveCriticalSection(&spawnLock);
-
-    /* rshd keeps the read end of stdout/stderr and the write end of stdin */
-    CloseHandle(outWrite);
-    CloseHandle(inRead);
-    if (sep) {
-        CloseHandle(errWrite);
-    }
-
+    why[0] = 0;
+    sep = c->errSock != INVALID_SOCKET;
+    inEnd = outEnd = errEnd = NULL;
+    pi.hProcess = NULL;
+    shell = comspec != NULL ? comspec : "cmd";
+    q = strchr(shell, ' ') != NULL ? "\"" : "";
+    line = (char *)malloc(strlen(selfPath) + strlen(shell) + strlen(command) + 160);
+    ready = CreateSemaphore(NULL, 0, 0x7FFFFFFF, NULL);
+    c->stopEv = CreateEvent(NULL, TRUE, FALSE, NULL);
+    c->killEv = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ok = line != NULL && ready != NULL && c->stopEv != NULL && c->killEv != NULL
+         && makePipe(&c->out, &outEnd, 0) && makePipe(&c->in, &inEnd, 1)
+         && (!sep || makePipe(&c->err, &errEnd, 0));
     if (!ok) {
-        CloseHandle(outRead);
-        CloseHandle(inWrite);
-        if (sep) {
-            CloseHandle(errRead);
+        _snprintf(why, whySize - 1, "cannot make the command's pipes, error %lu", GetLastError());
+    } else {
+        sprintf(line, "\"%s\" -session %lu %lu %lu %lu %lu %lu %lu %lu %s%s%s /c %s",
+                selfPath, GetCurrentProcessId(), (DWORD)inEnd, (DWORD)outEnd, (DWORD)errEnd,
+                (DWORD)c->stopEv, (DWORD)c->killEv, (DWORD)ready, (DWORD)STOP_WAIT_MS,
+                q, shell, q, command);
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        ok = CreateProcess(selfPath, line, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+        if (!ok) {
+            pi.hProcess = NULL;
+            _snprintf(why, whySize - 1, "cannot start the session helper %s, error %lu", selfPath, GetLastError());
         }
-        SetLastError(err);
+    }
+    if (ok) {
+        CloseHandle(pi.hThread);
+        waits[0] = ready;
+        waits[1] = pi.hProcess;
+        r = WaitForMultipleObjects(2, waits, FALSE, READY_MS);
+        ok = r == WAIT_OBJECT_0;
+        if (ok) {
+            /* the wait took one off the count the helper released: put it
+               back and read the rest, which is the command's process id */
+            ReleaseSemaphore(ready, 1, &before);
+            c->cmdPid = (DWORD)before + 1;
+        } else if (r == WAIT_OBJECT_0 + 1) {
+            if (!GetExitCodeProcess(pi.hProcess, &code)) {
+                code = HELPER_FAIL | GetLastError();
+            }
+            if (code & HELPER_FAIL) {
+                _snprintf(why, whySize - 1, "the session helper could not set up, error %lu", code & ~HELPER_FAIL);
+            } else {
+                _snprintf(why, whySize - 1, "cannot start %s, error %lu", shell, code);
+            }
+        } else {
+            TerminateProcess(pi.hProcess, CONTROL_C_EXIT);
+            _snprintf(why, whySize - 1, "the session helper did not start the command within %d s", READY_MS / 1000);
+        }
+    }
+    why[whySize - 1] = 0;
+    /* the helper has its own copies by now: the pipes reach end-of-file
+       only when the command and what it started have closed theirs */
+    dropHandle(inEnd);
+    dropHandle(outEnd);
+    dropHandle(errEnd);
+    dropHandle(ready);
+    if (line != NULL) {
+        free(line);
+    }
+    if (!ok) {
+        dropHandle(pi.hProcess);
         return FALSE;
     }
-    CloseHandle(pi.hThread);
     c->proc = pi.hProcess;
     c->pid = pi.dwProcessId;
-    c->outPipe = outRead;
-    c->inPipe = inWrite;
-    c->errPipe = sep ? errRead : NULL;
-    logMsg("[%d] started cmd, process id %lu", c->id, pi.dwProcessId);
+    logMsg("[%d] started cmd, process id %lu (session helper %lu)", c->id, c->cmdPid, c->pid);
     return TRUE;
 }
 
 /* -------- running-command table (for shutdown) --------------------------- */
 
-static void addRunning(CONN *c) {
+/* puts the session on the list of running commands, which the status window
+   and the quit use; 0 when the list is full */
+static int addRunning(CONN *c) {
     int i;
 
     EnterCriticalSection(&runLock);
     for (i = 0; i < MAX_RUNNING; i++) {
         if (running[i] == NULL) {
             running[i] = c;
+            c->slot = i;
             break;
         }
     }
     LeaveCriticalSection(&runLock);
+    return i < MAX_RUNNING;
 }
 
 static void dropRunning(CONN *c) {
-    int i;
-
     EnterCriticalSection(&runLock);
-    for (i = 0; i < MAX_RUNNING; i++) {
-        if (running[i] == c) {
-            running[i] = NULL;
-        }
+    if (c->slot >= 0 && running[c->slot] == c) {
+        running[c->slot] = NULL;
     }
+    c->slot = -1;
     LeaveCriticalSection(&runLock);
 }
 
-/* records why a command should stop; the owning thread escalates it */
+/* asks for a command to stop; its session thread wakes up and tells the
+   helper (see copyOutput) */
 static void stopCommand(CONN *c, int why) {
     if (c->stopWhy == STOP_NONE) {
         c->stopWhy = why;
+    }
+    if (c->wake != NULL) {
+        SetEvent(c->wake);
     }
 }
 
@@ -624,17 +801,15 @@ static int stopAll(int why) {
     return count;
 }
 
-/* kills every running command at once; each session thread then ends its
-   client as usual (see copyOutput) */
+/* stops every running command at once, without the grace period */
 static void killAll(void) {
-    CONN *c;
     int i;
 
     EnterCriticalSection(&runLock);
     for (i = 0; i < MAX_RUNNING; i++) {
-        c = running[i];
-        if (c != NULL && c->proc != NULL) {
-            TerminateProcess(c->proc, CONTROL_C_EXIT);
+        if (running[i] != NULL) {
+            running[i]->killNow = 1;
+            stopCommand(running[i], STOP_SHUTDOWN);
         }
     }
     LeaveCriticalSection(&runLock);
@@ -656,9 +831,9 @@ static int countRunning(void) {
 }
 
 /* After a quit is requested, wait up to graceMs for the running commands to
-   stop on their own: each one is sent CTRL_BREAK and then hard-killed by its
-   own session thread (see stopAll / copyOutput).  A second Ctrl+C makes the
-   handler end the process without waiting. */
+   stop: each session's helper sends CTRL_BREAK and kills its command after a
+   grace period (see runHelper).  A second Ctrl+C makes the handler end the
+   process without waiting; the helpers then kill their commands at once. */
 static void drainCommands(DWORD graceMs) {
     DWORD start;
 
@@ -673,14 +848,16 @@ static void drainCommands(DWORD graceMs) {
 /* a message for the client once its output has started: on the stderr
    channel if it has one, else on a line of its own after the output */
 static void sendNote(CONN *c, const char *text) {
-    char msg[LINE_SIZE];
+    char msg[LINE_SIZE + 16];
 
     if (c->errSock != INVALID_SOCKET) {
-        sprintf(msg, "rshd: %s\n", text);
+        _snprintf(msg, sizeof(msg) - 1, "rshd: %s\n", text);
+        msg[sizeof(msg) - 1] = 0;
         sendAll(c->errSock, msg, strlen(msg));
         return;
     }
-    sprintf(msg, "%srshd: %s\n", c->last == '\n' ? "" : "\n", text);
+    _snprintf(msg, sizeof(msg) - 1, "%srshd: %s\n", c->last == '\n' ? "" : "\n", text);
+    msg[sizeof(msg) - 1] = 0;
     sendAll(c->sock, msg, strlen(msg));
 }
 
@@ -706,279 +883,463 @@ static void reportStop(CONN *c) {
     sendNote(c, text);
 }
 
-/* sends what a pipe holds now: 1 sent something, 0 empty, -1 pipe gone or
-   the client is gone */
-static int drainPipe(CONN *c, HANDLE pipe, SOCKET dest, DWORD *total) {
-    char buf[IO_SIZE];
-    DWORD avail;
-    DWORD n;
+static DWORD minMs(DWORD a, DWORD b) {
+    return a < b ? a : b;
+}
 
-    if (pipe == NULL || dest == INVALID_SOCKET) {
-        return 0;
-    }
-    if (!PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL)) {
-        return -1;
-    }
-    if (avail == 0) {
-        return 0;
-    }
-    if (avail > sizeof(buf)) {
-        avail = sizeof(buf);
-    }
-    if (!ReadFile(pipe, buf, avail, &n, NULL) || n == 0) {
-        return -1;
-    }
-    if (!sendAll(dest, buf, (int)n)) {
-        stopCommand(c, STOP_GONE);
-        return -1;
-    }
-    *total += n;
-    c->last = buf[n - 1];
-    return 1;
+/* how long until limit ms have passed since since; 0 if they have */
+static DWORD leftMs(DWORD since, DWORD limit, DWORD now) {
+    DWORD used;
+
+    used = now - since;
+    return used >= limit ? 0 : limit - used;
 }
 
 /*
  * Copies all of the command's output to the client, then returns.
  *
- * PeekNamedPipe + a short wait on the process handle delivers every byte
- * with natural backpressure (send blocks when the client reads slowly) and
- * no busy loop.  The pipe reports end-of-file as soon as the child closes
- * its write ends, because rshd closed its own copies right after spawning.
- * A grandchild can keep the pipe open after cmd exits, so once cmd has
- * exited and the pipe has been empty for grandGrace, stop waiting.
+ * The pipes are read with overlapped ReadFile, so this thread sleeps until
+ * the command writes, it ends, or a stop is asked for: no polling, and
+ * every byte is sent before the end-of-file (ERROR_BROKEN_PIPE) behind it.
+ * send() blocks while the client reads slowly, which holds the command
+ * back: flow control without a busy loop.  The pipes reach end-of-file
+ * when the command and all it started have closed them; ntrshd and the
+ * helper keep no copies.  A program the command started can keep them open
+ * after it exits, so once the command has exited and the pipes have been
+ * quiet for grandGrace, stop waiting.  For rsh-mcp and -e the exit code
+ * comes after the output, so there the end also waits for the exit.
+ *
+ * A stop (signal, client gone, -t, quit) goes to the helper, which sends
+ * CTRL_BREAK and kills the command after a grace period.  If that takes too
+ * long the helper is told to kill at once, and if even that fails, the
+ * helper itself is ended.
  */
 static DWORD copyOutput(CONN *c) {
+    HANDLE waits[4];
+    PIPE *p;
+    SOCKET dest;
     DWORD total;
     DWORD quiet;
     DWORD noted;
-    DWORD emptyAt;
+    DWORD exitAt;
+    DWORD stopAt;
+    DWORD silent;
+    DWORD waitMs;
+    DWORD now;
+    int needExit;
     int exited;
-    int so;
-    int se;
-    int escalated;
+    int stage;      /* 0 running, 1 told to stop, 2 told to kill, 3 helper ended */
+    int sent;
+    int nw;
+    int n;
+    int i;
 
     total = 0;
     quiet = GetTickCount();
     noted = quiet;
-    emptyAt = 0;
-    escalated = 0;
+    exitAt = 0;
+    stopAt = 0;
+    exited = 0;
+    stage = 0;
+    needExit = c->marker[0] != 0 || sendExit;
+    c->endWhy = END_EOF;
     for (;;) {
-        exited = WaitForSingleObject(c->proc, 0) == WAIT_OBJECT_0;
-        so = drainPipe(c, c->outPipe, c->sock, &total);
-        se = (c->errPipe != NULL) ? drainPipe(c, c->errPipe, c->errSock, &total) : 0;
-        if (so > 0 || se > 0) {
+        /* send what the pipes hold now, and start the reads that wait */
+        sent = 0;
+        for (i = 0; i < 2; i++) {
+            p = (i == 0) ? &c->out : &c->err;
+            dest = (i == 0) ? c->sock : c->errSock;
+            n = readPipe(p);
+            if (n <= 0) {
+                continue;
+            }
+            sent = 1;
             quiet = GetTickCount();
             noted = quiet;
-            emptyAt = 0;
+            if (c->stopWhy == STOP_GONE) {
+                continue;           /* no one to send it to: drop it */
+            }
+            if (!sendAll(dest, p->buf, n)) {
+                logMsg("[%d] cannot send to the client, error %d: it is gone", c->id, WSAGetLastError());
+                stopCommand(c, STOP_GONE);
+                continue;
+            }
+            total += (DWORD)n;
+            c->last = p->buf[n - 1];
+        }
+        if (sent) {
             continue;
         }
-        if (so < 0) {
-            break;   /* stdout pipe reached end-of-file (or client gone) */
+
+        now = GetTickCount();
+        if (!exited && WaitForSingleObject(c->proc, 0) == WAIT_OBJECT_0) {
+            exited = 1;
+            exitAt = now;
+            logDebug("[%d] the command exited", c->id);
         }
-        /* nothing available right now */
-        if (c->stopWhy != STOP_NONE && !escalated) {
-            escalated = 1;
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, c->pid);
-            if (WaitForSingleObject(c->proc, STOP_WAIT_MS) != WAIT_OBJECT_0) {
-                logMsg("[%d] command did not stop, terminating it", c->id);
+        silent = exited ? minMs(now - quiet, now - exitAt) : 0;
+
+        /* a stop goes to the helper; escalate if it does not manage */
+        if (c->stopWhy != STOP_NONE && !exited) {
+            if (stage == 0) {
+                stage = 1;
+                stopAt = now;
+                SetEvent(c->stopEv);
+                logDebug("[%d] told the helper to stop the command", c->id);
+            }
+            if (stage == 1 && (c->killNow || now - stopAt >= STOP_WAIT_MS + KILL_EXTRA_MS)) {
+                stage = 2;
+                SetEvent(c->killEv);
+                if (c->killNow) {
+                    logDebug("[%d] told the helper to kill the command now", c->id);
+                } else {
+                    logMsg("[%d] the command did not stop, killing it", c->id);
+                }
+            }
+            if (stage == 2 && now - stopAt >= STOP_WAIT_MS + 2 * KILL_EXTRA_MS) {
+                stage = 3;
                 TerminateProcess(c->proc, CONTROL_C_EXIT);
+                logMsg("[%d] the session helper does not answer, ending it", c->id);
             }
-            continue;
         }
-        if (exited) {
-            if (emptyAt == 0) {
-                emptyAt = GetTickCount();
-            }
-            /* quitting: no point waiting for a grandchild's output */
-            if (GetTickCount() - emptyAt >= grandGrace || c->stopWhy == STOP_SHUTDOWN) {
+
+        /* the end of the output */
+        if (!isOpen(&c->out) && !isOpen(&c->err)) {
+            if (!needExit || exited) {
+                logDebug("[%d] end of output", c->id);
                 break;
             }
-        } else if (idleLimit != 0 && c->stopWhy == STOP_NONE && GetTickCount() - quiet >= idleLimit) {
-            stopCommand(c, STOP_IDLE);
+        } else if (exited && (silent >= grandGrace || c->stopWhy == STOP_SHUTDOWN || c->stopWhy == STOP_GONE)) {
+            c->endWhy = END_HELD;
+            break;
         }
-        if (GetTickCount() - noted >= NOTE_MS) {
-            noted = GetTickCount();
-            logMsg("[%d] still running, no output for %lu seconds", c->id, (noted - quiet) / 1000);
+
+        if (!exited && c->stopWhy == STOP_NONE) {
+            if (idleLimit != 0 && now - quiet >= idleLimit) {
+                stopCommand(c, STOP_IDLE);
+                continue;
+            }
+            if (now - noted >= NOTE_MS) {
+                noted = now;
+                logMsg("[%d] still running, no output for %lu seconds", c->id, (now - quiet) / 1000);
+            }
+        }
+
+        /* sleep until the command writes or ends, a stop comes, or the next
+           deadline */
+        nw = 0;
+        if (c->out.pending) {
+            waits[nw++] = c->out.ov.hEvent;
+        }
+        if (c->err.pending) {
+            waits[nw++] = c->err.ov.hEvent;
+        }
+        waits[nw++] = c->wake;
+        if (!exited) {
+            waits[nw++] = c->proc;
+        }
+        waitMs = INFINITE;
+        if (!exited && c->stopWhy == STOP_NONE) {
+            waitMs = leftMs(noted, NOTE_MS, now);
+            if (idleLimit != 0) {
+                waitMs = minMs(waitMs, leftMs(quiet, idleLimit, now));
+            }
         }
         if (exited) {
-            Sleep(POLL_MS);
-        } else {
-            WaitForSingleObject(c->proc, POLL_MS);
+            waitMs = minMs(waitMs, silent < grandGrace ? grandGrace - silent : 0);
+        }
+        if (!exited && (stage == 1 || stage == 2)) {
+            waitMs = minMs(waitMs, leftMs(stopAt, STOP_WAIT_MS + stage * KILL_EXTRA_MS, now));
+        }
+        if (WaitForMultipleObjects(nw, waits, FALSE, waitMs) == WAIT_FAILED) {
+            logMsg("[%d] wait failed, error %lu", c->id, GetLastError());
+            Sleep(MONITOR_MS);
         }
     }
     if (c->stopWhy != STOP_NONE) {
+        c->endWhy = END_STOPPED;
         reportStop(c);
     }
     return total;
 }
 
-/* -------- the input / disconnect monitor thread -------------------------- */
+/* -------- the input thread ----------------------------------------------- */
+
+/* the command gets no more input: end-of-file on its stdin */
+static void closeStdin(CONN *c) {
+    if (!closePipe(&c->in)) {
+        c->leak = 1;
+    }
+}
+
+/* writes the rest of c->in.buf to the command's stdin.  When the pipe is
+   full the write stays in flight (c->in.pending) and the thread goes on
+   watching the client, which TCP flow control holds back meanwhile. */
+static void writeStdin(CONN *c) {
+    DWORD n;
+
+    while (c->in.pipe != NULL && c->in.off < c->in.len) {
+        if (!WriteFile(c->in.pipe, c->in.buf + c->in.off, c->in.len - c->in.off, &n, &c->in.ov)) {
+            if (GetLastError() == ERROR_IO_PENDING) {
+                c->in.pending = 1;
+                return;
+            }
+            logDebug("[%d] the command closed its stdin; more input is dropped", c->id);
+            closeStdin(c);
+            return;
+        }
+        c->in.off += n;
+    }
+}
+
+/* a stdin write in flight: 1 once it (and what is left) is written, 0 if
+   it still waits */
+static int stdinWritten(CONN *c) {
+    DWORD n;
+
+    if (WaitForSingleObject(c->in.ov.hEvent, 0) != WAIT_OBJECT_0) {
+        return 0;
+    }
+    c->in.pending = 0;
+    if (!GetOverlappedResult(c->in.pipe, &c->in.ov, &n, FALSE)) {
+        logDebug("[%d] the command closed its stdin; more input is dropped", c->id);
+        closeStdin(c);
+        return 1;
+    }
+    c->in.off += n;
+    writeStdin(c);
+    return !c->in.pending;
+}
+
+/* a byte on the stderr channel is a signal; 1 if one came */
+static int readSignal(CONN *c) {
+    char sig;
+
+    if (recv(c->errSock, &sig, 1, 0) == 1) {
+        logMsg("[%d] client sent signal %d", c->id, (unsigned char)sig);
+        stopCommand(c, STOP_SIGNAL);
+        return 1;
+    }
+    c->errWatch = 0;            /* the client closed the stderr channel */
+    return 0;
+}
+
+/* looks for a signal without waiting */
+static int pollSignal(CONN *c) {
+    struct timeval tv;
+    fd_set fds;
+
+    FD_ZERO(&fds);
+    FD_SET(c->errSock, &fds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(0, &fds, NULL, NULL, &tv) == 1 && readSignal(c);
+}
 
 /*
- * Reads the main socket while the command runs: bytes become the command's
- * stdin; a graceful close means no more input; a reset means the client is
- * gone, so the command is stopped.  A byte on the stderr channel is a signal
- * (BSD rsh sends one on Ctrl+C) and also stops the command.  The thread ends
- * when told to (c->done) or when the client is gone, and signals monitorDone.
+ * Watches the client while the command runs.  Bytes on the main socket
+ * become the command's stdin.  A byte on the stderr channel is a signal
+ * (BSD rsh sends one on Ctrl+C) and stops the command.  A reset means the
+ * client is gone, and stops it too.  A graceful close (FIN) means no more
+ * input, as in BSD rsh, except in an rsh-mcp script session: there the
+ * input was the script, read before the command started, so a FIN means
+ * rsh-mcp gave up (its timeout, or a cancel) and the command is stopped.
+ *
+ * Writes to stdin are overlapped, so a command that does not read its
+ * stdin cannot block this thread.  When a stop is asked for, stdin is
+ * closed, so a batch file asking "Terminate batch job (Y/N)?" ends.  The
+ * thread ends when told to (c->done), when the client is gone, or when
+ * there is nothing left to watch, and signals monitorDone.
  */
 static void __cdecl monitorThread(void *arg) {
     CONN *c;
-    char buf[IO_SIZE];
     struct timeval tv;
     fd_set fds;
     int n;
-    int watching;
 
     c = (CONN *)arg;
     while (!c->done) {
-        watching = 0;
+        if (c->stopWhy != STOP_NONE && c->in.pipe != NULL) {
+            closeStdin(c);
+        }
+        if (c->in.pending && !stdinWritten(c)) {
+            if (c->errWatch && pollSignal(c)) {
+                break;
+            }
+            WaitForSingleObject(c->in.ov.hEvent, MONITOR_MS);
+            continue;
+        }
+        if (!c->sockWatch && !c->errWatch) {
+            break;
+        }
         FD_ZERO(&fds);
         if (c->sockWatch) {
             FD_SET(c->sock, &fds);
-            watching = 1;
         }
-        if (c->errWatch && c->errSock != INVALID_SOCKET) {
+        if (c->errWatch) {
             FD_SET(c->errSock, &fds);
-            watching = 1;
         }
-        if (!watching) {
-            Sleep(100);
-            continue;
-        }
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        n = select(0, &fds, NULL, NULL, &tv);
-        if (n <= 0) {
+        tv.tv_sec = 0;
+        tv.tv_usec = MONITOR_MS * 1000L;
+        if (select(0, &fds, NULL, NULL, &tv) <= 0) {
             continue;
         }
         if (c->sockWatch && FD_ISSET(c->sock, &fds)) {
-            n = recv(c->sock, buf, sizeof(buf), 0);
+            n = recv(c->sock, c->in.buf, IO_SIZE, 0);
             if (n > 0) {
-                if (c->inPipe != NULL) {
-                    DWORD w;
-                    if (!WriteFile(c->inPipe, buf, (DWORD)n, &w, NULL)) {
-                        c->sockWatch = 0;   /* child stdin is gone */
-                    }
-                }
-            } else if (n == 0) {
-                if (c->inPipe != NULL) {
-                    CloseHandle(c->inPipe);
-                    c->inPipe = NULL;       /* give the command stdin EOF */
-                }
-                c->sockWatch = 0;           /* client just half-closed; keep serving output */
+                c->inBytes += (DWORD)n;
+                c->in.len = (DWORD)n;
+                c->in.off = 0;
+                writeStdin(c);
+            } else if (c->done) {
+                break;                  /* the session is over and the client closes */
+            } else if (n == 0 && c->marker[0] == 0) {
+                logDebug("[%d] the client closed its input after %lu bytes: end-of-file on stdin", c->id, c->inBytes);
+                closeStdin(c);
+                c->sockWatch = 0;
             } else {
-                logMsg("[%d] connection reset by the client", c->id);
+                logMsg(n == 0 ? "[%d] the client closed the connection" : "[%d] connection reset by the client", c->id);
                 stopCommand(c, STOP_GONE);
                 break;
             }
         }
-        if (c->errWatch && c->errSock != INVALID_SOCKET && FD_ISSET(c->errSock, &fds)) {
-            n = recv(c->errSock, buf, 1, 0);
-            if (n == 1) {
-                logMsg("[%d] client sent signal %d", c->id, (unsigned char)buf[0]);
-                stopCommand(c, STOP_SIGNAL);
-                break;
-            }
-            c->errWatch = 0;                /* stderr channel closed */
+        if (c->errWatch && FD_ISSET(c->errSock, &fds) && readSignal(c)) {
+            break;
         }
     }
+    closeStdin(c);
     SetEvent(c->monitorDone);
 }
 
 /* -------- exec --------------------------------------------------------- */
 
+/* how the command's output ended, for the log */
+static void endText(CONN *c, char *text) {
+    switch (c->endWhy) {
+    case END_HELD:
+        sprintf(text, "it exited, a program it started still held the output after %lu s", grandGrace / 1000);
+        break;
+    case END_STOPPED:
+        switch (c->stopWhy) {
+        case STOP_IDLE:
+            strcpy(text, "stopped: no output for too long");
+            break;
+        case STOP_SIGNAL:
+            strcpy(text, "stopped: the client sent a signal");
+            break;
+        case STOP_SHUTDOWN:
+            strcpy(text, "stopped: rshd is quitting");
+            break;
+        default:
+            strcpy(text, "stopped: the client went away");
+            break;
+        }
+        break;
+    default:
+        strcpy(text, "end of output");
+        break;
+    }
+}
+
+/* the end of the output: the exit code line for rsh-mcp or -e, and the log
+   line that says how the command ended */
 static void logExit(CONN *c, DWORD total) {
+    char line[MARK_SIZE + 64];
+    char how[128];
     DWORD code;
 
+    endText(c, how);
     if (WaitForSingleObject(c->proc, 1000) != WAIT_OBJECT_0 || !GetExitCodeProcess(c->proc, &code)) {
-        logMsg("[%d] done, %lu bytes sent, cmd still running", c->id, total);
+        logMsg("[%d] done, %lu bytes sent, cmd still running (%s)", c->id, total, how);
         return;
     }
     if (c->marker[0] != 0) {
-        char line[MARK_SIZE + 16];
         sprintf(line, "%s%lu__\n", c->marker, code);
         sendAll(c->sock, line, strlen(line));
     } else if (sendExit) {
-        char line[64];
         sprintf(line, "%srshd: exit code %lu\n", c->last == '\n' ? "" : "\n", code);
         sendAll(c->sock, line, strlen(line));
     }
     if (code > 0xFFFF) {
-        logMsg("[%d] done, %lu bytes sent, exit code 0x%08lx", c->id, total, code);
+        logMsg("[%d] done, %lu bytes sent, exit code 0x%08lx (%s)", c->id, total, code, how);
     } else {
-        logMsg("[%d] done, %lu bytes sent, exit code %lu", c->id, total, code);
+        logMsg("[%d] done, %lu bytes sent, exit code %lu (%s)", c->id, total, code, how);
     }
 }
 
+/* frees what the command used; the input thread must have ended */
 static void endCommand(CONN *c) {
-    if (c->proc == NULL) {
-        return;
-    }
     dropRunning(c);
-    if (c->outPipe != NULL) {
-        CloseHandle(c->outPipe);
-        c->outPipe = NULL;
+    if (!freePipe(&c->out)) {
+        c->leak = 1;
     }
-    if (c->errPipe != NULL) {
-        CloseHandle(c->errPipe);
-        c->errPipe = NULL;
+    if (!freePipe(&c->err)) {
+        c->leak = 1;
     }
-    if (c->inPipe != NULL) {
-        CloseHandle(c->inPipe);
-        c->inPipe = NULL;
+    if (!freePipe(&c->in)) {
+        c->leak = 1;
     }
-    CloseHandle(c->proc);
+    dropHandle(c->stopEv);
+    c->stopEv = NULL;
+    dropHandle(c->killEv);
+    c->killEv = NULL;
+    dropHandle(c->proc);
     c->proc = NULL;
 }
 
-/* the command has started: show it in the status window and the quit list */
-static void addCommand(CONN *c, char *command) {
+/* ends the command at once: the session cannot go on */
+static void killCommand(CONN *c) {
+    if (c->proc == NULL) {
+        return;
+    }
+    SetEvent(c->killEv);
+    if (WaitForSingleObject(c->proc, STOP_WAIT_MS) != WAIT_OBJECT_0) {
+        TerminateProcess(c->proc, CONTROL_C_EXIT);
+    }
+}
+
+/* shows the command in the status window and puts it on the quit list
+   before it starts; 0 if too many commands run already */
+static int addCommand(CONN *c, char *command) {
     _snprintf(c->cmd, sizeof(c->cmd) - 1, "%s", command);
     c->cmd[sizeof(c->cmd) - 1] = 0;
     c->startTick = GetTickCount();
-    addRunning(c);
+    if (!addRunning(c)) {
+        logMsg("[%d] %d commands run already, refusing another", c->id, MAX_RUNNING);
+        return 0;
+    }
+    return 1;
 }
 
-/* the command runs and the client has its status byte: serve it to the end */
+/* the command runs and the client has its status byte: serve it to the end
+   (connThread then ends the connection and waits for the input thread) */
 static void serveCommand(CONN *c) {
-    DWORD total;
-
     c->monitorDone = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (c->monitorDone == NULL || _beginthread(monitorThread, 0, c) == (unsigned long)-1L) {
-        /* no monitor: serve output anyway, without stdin or disconnect-stop */
-        logMsg("[%d] cannot start monitor thread, running without it", c->id);
+        logMsg("[%d] cannot start the input thread: the command gets no input", c->id);
         if (c->monitorDone != NULL) {
             CloseHandle(c->monitorDone);
             c->monitorDone = NULL;
         }
+        closeStdin(c);
     }
-
-    total = copyOutput(c);
-
-    /* stop the monitor thread and wait for it to really end before freeing */
-    c->done = 1;
-    if (c->monitorDone != NULL) {
-        WaitForSingleObject(c->monitorDone, INFINITE);
-        CloseHandle(c->monitorDone);
-        c->monitorDone = NULL;
-    }
-    logExit(c, total);
-    endCommand(c);
+    logExit(c, copyOutput(c));
 }
 
 static void doExec(CONN *c, char *command) {
-    if (!startCommand(c, command)) {
-        sendErr(c, "rshd: cannot start %s, error %lu", comspec != NULL ? comspec : "cmd", GetLastError());
+    char why[LINE_SIZE];
+
+    if (!addCommand(c, command)) {
+        sendErr(c, "rshd: too many commands running, try again later");
         return;
     }
-    addCommand(c, command);
+    if (!startCommand(c, command, why, sizeof(why))) {
+        sendErr(c, "rshd: %s", why);
+        return;
+    }
     if (!sendByte(c->sock, 0)) {
         logMsg("[%d] client went away before the output started", c->id);
-        stopCommand(c, STOP_GONE);
-        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, c->pid);
-        WaitForSingleObject(c->proc, STOP_WAIT_MS);
-        TerminateProcess(c->proc, CONTROL_C_EXIT);
-        endCommand(c);
+        killCommand(c);
         return;
     }
     c->started = 1;
@@ -1072,7 +1433,8 @@ static int scriptEnds(CONN *c, char *body, char *end) {
 }
 
 /* reads the script: the command's lines into body, each ending in \n, and
-   the marker into c->marker; 0 if it does not arrive whole or does not fit */
+   the marker into c->marker; 0 if it does not arrive whole and in time, or
+   does not fit */
 static int readScript(CONN *c, char *body, int size) {
     char line[CMD_SIZE];
     int used;
@@ -1080,7 +1442,7 @@ static int readScript(CONN *c, char *body, int size) {
     int n;
 
     for (n = 0; ; n++) {
-        if (n == 4 || readUntil(c->sock, line, sizeof(line), '\n') < 0) {
+        if (n == 4 || readUntil(c, line, sizeof(line), '\n') < 0) {
             return 0;
         }
         trimCr(line);
@@ -1091,7 +1453,7 @@ static int readScript(CONN *c, char *body, int size) {
     used = 0;
     body[0] = 0;
     for (;;) {
-        if (readUntil(c->sock, line, sizeof(line), '\n') < 0) {
+        if (readUntil(c, line, sizeof(line), '\n') < 0) {
             return 0;
         }
         trimCr(line);
@@ -1142,13 +1504,17 @@ static void doScript(CONN *c) {
     char body[CMD_SIZE];
     char command[CMD_SIZE];
     char text[LINE_SIZE];
+    int whole;
 
     if (!sendByte(c->sock, 0)) {
         logMsg("[%d] client went away before its script came", c->id);
         return;
     }
     c->started = 1;
-    if (!readScript(c, body, sizeof(body))) {
+    limitReads(c, 1);
+    whole = readScript(c, body, sizeof(body));
+    limitReads(c, 0);
+    if (!whole) {
         logMsg("[%d] the rsh-mcp script did not arrive whole, or is too long", c->id);
         sendNote(c, "the rsh-mcp script did not arrive whole, or is too long");
         return;
@@ -1159,15 +1525,16 @@ static void doScript(CONN *c) {
         return;
     }
     logMsg("[%d] rsh-mcp script: %s", c->id, command);
-    if (!startCommand(c, command)) {
-        sprintf(text, "cannot start %s, error %lu", comspec != NULL ? comspec : "cmd", GetLastError());
+    if (!addCommand(c, command)) {
+        sendNote(c, "too many commands running, try again later");
+        return;
+    }
+    if (!startCommand(c, command, text, sizeof(text))) {
         logMsg("[%d] %s", c->id, text);
         sendNote(c, text);
         return;
     }
-    CloseHandle(c->inPipe);   /* the script was the input: the command gets none */
-    c->inPipe = NULL;
-    addCommand(c, command);
+    closeStdin(c);   /* the script was the input: the command gets none */
     serveCommand(c);
 }
 
@@ -1215,7 +1582,7 @@ static int recvToFile(CONN *c, HANDLE file, DWORD size) {
         if (size - done < (DWORD)want) {
             want = (int)(size - done);
         }
-        n = recvWait(c->sock, buf, want);
+        n = recvWait(c, buf, want);
         if (n <= 0) {
             return -1;
         }
@@ -1289,7 +1656,7 @@ static void rcpSink(CONN *c, char *target, int mustBeDir) {
         return;
     }
     for (;;) {
-        if (readUntil(c->sock, line, sizeof(line), '\n') < 0) {
+        if (readUntil(c, line, sizeof(line), '\n') < 0) {
             return;
         }
         switch (line[0]) {
@@ -1459,7 +1826,8 @@ static int doRcp(CONN *c, char *command) {
 /* -------- a connection --------------------------------------------------- */
 
 /* rsh request: stderr port, client user, server user, command, each ending
-   in a zero byte; the stderr channel is connected before the rest arrives */
+   in a zero byte; the stderr channel is connected before the rest arrives.
+   The whole request must arrive within IO_SECONDS. */
 static void handleConn(CONN *c) {
     char errPort[FIELD_SIZE];
     char localUser[FIELD_SIZE];
@@ -1467,7 +1835,8 @@ static void handleConn(CONN *c) {
     char command[CMD_SIZE];
     int port;
 
-    if (readUntil(c->sock, errPort, sizeof(errPort), 0) < 0) {
+    limitReads(c, 1);
+    if (readUntil(c, errPort, sizeof(errPort), 0) < 0) {
         logMsg("[%d] no request: the client closed, timed out or sent too much", c->id);
         return;
     }
@@ -1480,12 +1849,13 @@ static void handleConn(CONN *c) {
         }
         c->errWatch = 1;
     }
-    if (readUntil(c->sock, localUser, sizeof(localUser), 0) < 0 ||
-        readUntil(c->sock, remoteUser, sizeof(remoteUser), 0) < 0 ||
-        readUntil(c->sock, command, sizeof(command), 0) < 0) {
-        sendErr(c, "rshd: bad request");
+    if (readUntil(c, localUser, sizeof(localUser), 0) < 0 ||
+        readUntil(c, remoteUser, sizeof(remoteUser), 0) < 0 ||
+        readUntil(c, command, sizeof(command), 0) < 0) {
+        sendErr(c, "rshd: bad request: cut short, too slow, or a field too long");
         return;
     }
+    limitReads(c, 0);
     logMsg("[%d] %s@%s: %s", c->id, localUser, c->ip, command);
     if (command[0] == 0) {
         sendErr(c, "rshd: no command");
@@ -1507,6 +1877,7 @@ static void internalError(CONN *c, DWORD code) {
     sprintf(text, "internal error %08lx, rshd keeps running", code);
     if (c->proc != NULL) {
         stopCommand(c, STOP_GONE);
+        killCommand(c);
     }
     if (c->started) {
         logMsg("[%d] %s", c->id, text);
@@ -1517,29 +1888,52 @@ static void internalError(CONN *c, DWORD code) {
 }
 
 static void __cdecl connThread(void *arg) {
+    unsigned char *ip;
     CONN *c;
 
     c = (CONN *)arg;
+    ip = (unsigned char *)&c->peer.sin_addr;
+    sprintf(c->ip, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+    logMsg("[%d] connection from %s port %d", c->id, c->ip, ntohs(c->peer.sin_port));
+    c->wake = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (c->wake == NULL) {
+        logMsg("[%d] cannot make an event, error %lu, dropping the connection", c->id, GetLastError());
+        closesocket(c->sock);
+        free(c);
+        return;
+    }
+    setNoDelay(c->sock);
     __try {
         handleConn(c);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         internalError(c, GetExceptionCode());
     }
-    endCommand(c);
+    /* the FIN goes out first, so the client sees the end of the output at
+       once; then the input thread must end before what it uses is freed */
     c->done = 1;
+    c->finTick = GetTickCount();
+    sendFin(c->errSock);
+    sendFin(c->sock);
     if (c->monitorDone != NULL) {
         WaitForSingleObject(c->monitorDone, INFINITE);
         CloseHandle(c->monitorDone);
         c->monitorDone = NULL;
     }
-    closeConn(c->errSock);
-    closeConn(c->sock);
+    endCommand(c);
+    closeConn(c, c->errSock, "stderr channel");
+    closeConn(c, c->sock, "connection");
     logMsg("[%d] connection closed", c->id);
+    dropHandle(c->wake);
+    if (c->leak) {
+        logMsg("[%d] a cancelled pipe read or write never ended; its memory is kept", c->id);
+        return;
+    }
     free(c);
 }
 
+/* hands the connection to a thread of its own and returns at once, so the
+   accepting thread is ready for the next one (see acceptLoop) */
 static void startConn(SOCKET s, struct sockaddr_in *peer, int id) {
-    unsigned char *ip;
     CONN *c;
 
     c = (CONN *)malloc(sizeof(CONN));
@@ -1551,14 +1945,11 @@ static void startConn(SOCKET s, struct sockaddr_in *peer, int id) {
     memset(c, 0, sizeof(CONN));
     c->sock = s;
     c->errSock = INVALID_SOCKET;
-    setNoDelay(s);
     c->peer = *peer;
     c->id = id;
+    c->slot = -1;
     c->sockWatch = 1;
     c->last = '\n';
-    ip = (unsigned char *)&peer->sin_addr;
-    sprintf(c->ip, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-    logMsg("[%d] connection from %s port %d", id, c->ip, ntohs(peer->sin_port));
     if (_beginthread(connThread, 0, c) == (unsigned long)-1L) {
         logMsg("[%d] cannot start a thread", id);
         closesocket(s);
@@ -1596,7 +1987,6 @@ static SOCKET bindListener(int port, int reuse) {
     if (s == INVALID_SOCKET) {
         return INVALID_SOCKET;
     }
-    noInheritSock(s);
     on = 1;
     if (reuse) {
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
@@ -1703,6 +2093,11 @@ static void acceptLoop(int port) {
     int fails;
     int len;
 
+    /* NT Workstation keeps at most 5 connections waiting for accept() and
+       refuses the rest.  Above the session threads, this thread takes each
+       connection as soon as it comes, even on one busy CPU; it sleeps in
+       accept() the rest of the time.  New threads start at normal priority. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     fails = 0;
     for (;;) {
         if (!runFlag) {
@@ -1738,7 +2133,6 @@ static void acceptLoop(int port) {
             continue;
         }
         fails = 0;
-        noInheritSock(s);
         connCount++;
         startConn(s, &peer, connCount);
     }
@@ -1797,9 +2191,9 @@ static void releasePort(void) {
 
 /* -------- console control ------------------------------------------------ */
 
-/* stops accepting and tells every running command to stop; each session
-   thread sends CTRL_BREAK, then kills its command after a grace period
-   (see copyOutput) */
+/* stops accepting and tells every running command to stop; each session's
+   helper sends CTRL_BREAK, then kills its command after a grace period
+   (see runHelper) */
 static void requestQuit(void) {
     runFlag = 0;
     if (quitEvent != NULL) {
@@ -1879,12 +2273,13 @@ static void SVCAPI serviceCtrl(DWORD code) {
 }
 
 static void openLogFile(void) {
-    char path[MAX_PATH];
+    char path[MAX_PATH + 16];
     char *name;
 
-    if (GetModuleFileName(NULL, path, sizeof(path)) == 0) {
+    if (GetModuleFileName(NULL, path, MAX_PATH) == 0) {
         return;
     }
+    path[MAX_PATH - 1] = 0;
     name = baseName(path);
     *name = 0;
     strcat(path, "ntrshd.log");
@@ -1938,6 +2333,11 @@ static int beginServe(void) {
     int err;
 
     comspec = getenv("COMSPEC");
+    if (GetModuleFileName(NULL, selfPath, sizeof(selfPath)) == 0) {
+        logMsg("cannot find my own path, error %lu", GetLastError());
+        return 0;
+    }
+    selfPath[sizeof(selfPath) - 1] = 0;
     /* a program that cannot load or crashes must fail at once, not pop up a
        box that would hang the client; commands inherit this mode */
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1971,6 +2371,9 @@ static void SVCAPI serviceMain(DWORD argc, LPTSTR *argv) {
     if (beginServe()) {
         reportStatus(SERVICE_RUNNING, NO_ERROR, 0);
         serve(rshPort);
+        /* stopping: the running commands get their grace period */
+        reportStatus(SERVICE_STOP_PENDING, NO_ERROR, STOP_WAIT_MS + 4000);
+        drainCommands(STOP_WAIT_MS + 2000);
     }
     releasePort();
     logMsg("ntrshd service stopped");
@@ -1984,13 +2387,14 @@ static void doInstall(char *user, char *password, char *extra) {
     SC_HANDLE svc;
     char myPath[MAX_PATH];
     char sysDir[MAX_PATH];
-    char binPath[MAX_PATH];
-    char image[MAX_PATH + 256];
+    char binPath[MAX_PATH + 16];
+    char image[MAX_PATH + EXTRA_SIZE + 32];
 
     if (GetModuleFileName(NULL, myPath, sizeof(myPath)) == 0) {
         printf("cannot find my own path, error %lu\n", GetLastError());
         return;
     }
+    myPath[sizeof(myPath) - 1] = 0;
     if (GetSystemDirectory(sysDir, sizeof(sysDir)) == 0) {
         printf("cannot find the system directory, error %lu\n", GetLastError());
         return;
@@ -2103,7 +2507,7 @@ static void usage(void) {
 /* parses options, performs -install/-remove/-h/-v and exits for those;
    returns 1 if the daemon should start, 0 for a bad option */
 static int parseArgs(int argc, char **argv) {
-    char extra[512];
+    char extra[EXTRA_SIZE];
     char *user;
     char *password;
     int minutes;
@@ -2121,9 +2525,12 @@ static int parseArgs(int argc, char **argv) {
                     user = argv[++x];
                 } else if (lstrcmpi(argv[x], "-pass") == 0 && x + 1 < argc) {
                     password = argv[++x];
-                } else {
+                } else if (strlen(extra) + strlen(argv[x]) + 2 <= sizeof(extra)) {
                     strcat(extra, " ");
                     strcat(extra, argv[x]);
+                } else {
+                    printf("the options after -install are too long\n");
+                    exit(1);
                 }
             }
             doInstall(user, password, extra);
@@ -2199,8 +2606,10 @@ static int looksInteractive(void) {
 
 static void showSettings(void) {
     char dir[MAX_PATH];
+    DWORD n;
 
-    if (!GetCurrentDirectory(sizeof(dir), dir)) {
+    n = GetCurrentDirectory(sizeof(dir), dir);
+    if (n == 0 || n >= sizeof(dir)) {
         strcpy(dir, "?");
     }
     logMsg("ntrshd %s for Windows NT", RSHD_VERSION);
@@ -2213,7 +2622,10 @@ static void showSettings(void) {
     if (idleLimit != 0) {
         logMsg("a command silent for %lu minute%s is stopped", idleLimit / 60000, idleLimit == 60000 ? "" : "s");
     }
-    logMsg("each command runs in its own hidden process group");
+    logMsg("each command runs in a hidden console of its own");
+    if (debugFlag) {
+        logMsg("debug log: one line per event");
+    }
     logMsg("Ctrl+C or Ctrl+Break quits; commands get a moment to stop, press again to kill now");
     logMsg("security: open (+ +)");
 }
@@ -2470,10 +2882,178 @@ static int runConsole(void) {
     return 0;
 }
 
+/* -------- the session helper --------------------------------------------- */
+
+static char *skipBlanks(char *p) {
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return p;
+}
+
+/* skips a command line's first word, which may be in quotes, and the
+   blanks after it */
+static char *skipWord(char *p) {
+    p = skipBlanks(p);
+    if (*p == '"') {
+        for (p++; *p != 0 && *p != '"'; p++) {
+        }
+        if (*p == '"') {
+            p++;
+        }
+    } else {
+        while (*p != 0 && *p != ' ' && *p != '\t') {
+            p++;
+        }
+    }
+    return skipBlanks(p);
+}
+
+static DWORD readNumber(char **p) {
+    DWORD n;
+
+    n = 0;
+    *p = skipBlanks(*p);
+    while (**p >= '0' && **p <= '9') {
+        n = n * 10 + (DWORD)(**p - '0');
+        (*p)++;
+    }
+    return n;
+}
+
+/* one of ntrshd's handles, given by its value there, as one of ours */
+static HANDLE fromParent(HANDLE parent, DWORD value, BOOL inherit) {
+    HANDLE h;
+
+    if (value == 0 || !DuplicateHandle(parent, (HANDLE)value, GetCurrentProcess(), &h, 0, inherit, DUPLICATE_SAME_ACCESS)) {
+        return NULL;
+    }
+    return h;
+}
+
+/* the helper outlives the CTRL_BREAK it sends its own console, and the
+   logoff of whoever is logged on (a service must); a close or a shutdown
+   ends it as usual */
+static BOOL WINAPI helperCtrl(DWORD type) {
+    return type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_LOGOFF_EVENT;
+}
+
+/*
+ * The session helper, "ntrshd -session ..." (see startCommand).  ntrshd
+ * starts it in a new hidden console with nothing inherited, and it runs
+ * the command in that console.  This gives each session:
+ *
+ *  - a console of its own, so a Ctrl+C, a Ctrl+Break or a closed console
+ *    in one session reaches neither another session nor ntrshd;
+ *  - a way to stop the command and what it started: CTRL_BREAK to every
+ *    process on the console, then TerminateProcess after a grace period.
+ *    ntrshd cannot do that itself (a console signal reaches only the
+ *    sender's own console, and NT has no AttachConsole), and as a service
+ *    it has no console at all;
+ *  - no stray handles: the helper copies the handles it needs out of
+ *    ntrshd with DuplicateHandle, by their values on its command line, so
+ *    nothing else of ntrshd's (its sockets, other sessions' pipes) is ever
+ *    inherited, on any NT version (SetHandleInformation came in 3.51);
+ *  - a command that dies with ntrshd, should ntrshd itself end.
+ *
+ * Command line:  -session PID IN OUT ERR STOP KILL READY GRACE COMMAND
+ * PID is ntrshd's process id; IN, OUT and ERR are the command's pipe ends
+ * (ERR 0 when stderr goes with stdout); STOP and KILL are events; READY is
+ * a semaphore, released by the command's process id once it runs; GRACE
+ * is in milliseconds; COMMAND is the rest of the line, run as it is.  The
+ * exit code is the command's.  If the command never ran it is the error:
+ * HELPER_FAIL plus the error if the helper could not get its handles, the
+ * error alone if the command could not start.
+ */
+static DWORD runHelper(void) {
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    HANDLE parent;
+    HANDLE in, out, err;
+    HANDLE stopEv, killEv, ready;
+    HANDLE waits[4];
+    DWORD value[6];
+    DWORD pid;
+    DWORD grace;
+    DWORD code;
+    DWORD r;
+    char *p;
+    int i;
+
+    SetConsoleCtrlHandler(helperCtrl, TRUE);
+    p = skipWord(GetCommandLine());     /* ntrshd */
+    p = skipWord(p);                    /* -session */
+    pid = readNumber(&p);
+    for (i = 0; i < 6; i++) {
+        value[i] = readNumber(&p);
+    }
+    grace = readNumber(&p);
+    p = skipBlanks(p);
+    parent = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, pid);
+    if (parent == NULL) {
+        return HELPER_FAIL | GetLastError();
+    }
+    in = fromParent(parent, value[0], TRUE);
+    out = fromParent(parent, value[1], TRUE);
+    err = fromParent(parent, value[2], TRUE);
+    stopEv = fromParent(parent, value[3], FALSE);
+    killEv = fromParent(parent, value[4], FALSE);
+    ready = fromParent(parent, value[5], FALSE);
+    if (in == NULL || out == NULL || (value[2] != 0 && err == NULL)
+        || stopEv == NULL || killEv == NULL || ready == NULL || *p == 0) {
+        return HELPER_FAIL | GetLastError();
+    }
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = in;
+    si.hStdOutput = out;
+    si.hStdError = err != NULL ? err : out;
+    if (!CreateProcess(NULL, p, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        return GetLastError();
+    }
+    CloseHandle(pi.hThread);
+    /* the command has its own copies: without ours the pipes reach
+       end-of-file as soon as it, and what it started, closes them */
+    CloseHandle(in);
+    CloseHandle(out);
+    if (err != NULL) {
+        CloseHandle(err);
+    }
+    if (!ReleaseSemaphore(ready, (LONG)pi.dwProcessId, NULL)) {
+        ReleaseSemaphore(ready, 1, NULL);
+    }
+    CloseHandle(ready);
+
+    waits[0] = pi.hProcess;
+    waits[1] = killEv;
+    waits[2] = parent;
+    waits[3] = stopEv;
+    r = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
+    if (r != WAIT_OBJECT_0) {
+        /* stop: CTRL_BREAK to everything on this console, a grace period,
+           then kill.  Kill, or ntrshd gone: the same without the grace. */
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+        if (r == WAIT_OBJECT_0 + 3) {
+            r = WaitForMultipleObjects(3, waits, FALSE, grace);
+        }
+        if (r != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, CONTROL_C_EXIT);
+        }
+    }
+    WaitForSingleObject(pi.hProcess, CANCEL_MS);
+    if (!GetExitCodeProcess(pi.hProcess, &code)) {
+        code = CONTROL_C_EXIT;
+    }
+    return code;
+}
+
 int main(int argc, char **argv) {
     SERVICE_TABLE_ENTRY dispatch[2];
 
-    InitializeCriticalSection(&spawnLock);
+    if (argc > 1 && strcmp(argv[1], "-session") == 0) {
+        return (int)runHelper();
+    }
     InitializeCriticalSection(&runLock);
     InitializeCriticalSection(&portLock);
     InitializeCriticalSection(&logLock);

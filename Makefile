@@ -36,6 +36,12 @@ RES = ntrshd.rbj
 RES = ntrshd.res
 !ENDIF
 
+# Visual C++ 4.x marks a program as made for Windows 4.0.  Mark it 3.10, as
+# the NT 3.1 SDK and Visual C++ 2.0 do, so NT 3.5 starts it too.
+!IF $(MSC) >= 1000
+LFLAGS = /link /subsystem:console,3.10
+!ENDIF
+
 all: ntrshd.exe
 
 ntrshd.res: ntrshd.rc ntrshd.ico
@@ -45,7 +51,7 @@ ntrshd.rbj: ntrshd.res
 	cvtres -$(CPU) ntrshd.res -o ntrshd.rbj
 
 ntrshd.exe: ntrshd.c $(RES)
-	cl /nologo /O2 /MT ntrshd.c $(RES) kernel32.lib advapi32.lib wsock32.lib libcmt.lib
+	cl /nologo /O2 /MT ntrshd.c $(RES) kernel32.lib advapi32.lib wsock32.lib libcmt.lib $(LFLAGS)
 
 clean:
 	-del ntrshd.obj

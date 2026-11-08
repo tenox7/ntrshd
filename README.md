@@ -6,9 +6,26 @@ software on an NT machine from elsewhere — for example from an AI agent over
 the `rsh` MCP server.
 
 One plain-C source. It builds with the **NT 3.1, 3.5 and 4.0 SDKs** and runs
-on **NT 3.1 and later**, on any CPU (x86, MIPS, Alpha, PowerPC).
+on **NT 3.1 and later**, on any CPU (x86, MIPS, Alpha, PowerPC). Every build
+has the same features.
 
 security: open (+ +)
+
+## Download
+
+Each [release](https://github.com/tenox7/ntrshd/releases) has an exe for
+every CPU and NT version, named `ntrshd-<cpu>-<nt>.exe`:
+
+| CPU | NT 3.1 | NT 3.5 / 3.51 | NT 4.0 |
+|---|---|---|---|
+| x86 | `ntrshd-x86-nt31.exe` | `ntrshd-x86-nt35.exe` | `ntrshd-x86-nt40.exe` |
+| MIPS | `ntrshd-mips-nt31.exe` | `ntrshd-mips-nt35.exe` | `ntrshd-mips-nt40.exe` |
+| Alpha | `ntrshd-axp-nt31.exe` | `ntrshd-axp-nt35.exe` | `ntrshd-axp-nt40.exe` |
+| PowerPC | none: NT 3.1 has no PowerPC | `ntrshd-ppc-nt35.exe` | `ntrshd-ppc-nt40.exe` |
+
+Take the one for your CPU and NT version. Each one also runs on later NT
+versions. You may rename it to `ntrshd.exe`; `-install` names its copy
+`ntrshd.exe` anyway.
 
 ## Build
 
@@ -21,19 +38,25 @@ nmake
 That's all, on every SDK (NT 3.1, 3.5, 4.0) and every CPU (x86, MIPS,
 Alpha, PowerPC). The `Makefile` asks `cl` for its version and does the rest.
 Compile and link go through `cl`, which calls the right linker (`link32` on
-NT 3.1, `link` on 3.5/4.0), so nothing names the linker or the architecture.
+NT 3.1, `link` later), so nothing names the linker or the architecture.
 
 The icon and version number live in `ntrshd.rc`, which `rc` builds into
-`ntrshd.res`. NT 3.5 and 4.0 link that straight into the exe. NT 3.1's
+`ntrshd.res`. NT 3.5 and later link that straight into the exe. NT 3.1's
 `link32` can't take a `.res`, so on NT 3.1 the Makefile first converts it
 with `cvtres` for the CPU in the `CPU` variable (`i386`, `MIPS` or `ALPHA`),
 which the SDK's setenv sets. Without `CPU` it assumes `i386`.
 
-- NT 3.1: Win32 SDK, `cl386` 8.00
-- NT 3.5 / 3.51: Visual C++ 2.0 (one binary runs 3.5 → 4.0)
-- NT 4.0: Visual C++ 4.2 (full feature set — see below)
+Visual C++ 4.x marks an exe as made for Windows 4.0. The Makefile marks it
+3.10 instead, as the older compilers do, so NT 3.5 starts it too.
 
-`nmake clean` removes the build output.
+The release exes were built on NT itself, each with its own compiler:
+
+- NT 3.1: the Win32 SDK of 1993 (`cl386` 8.00, and its MIPS and Alpha
+  compilers). The MIPS one ignores `/O2`, so that exe is not optimized.
+- NT 3.5: Visual C++ 4.x on NT 3.51.
+- NT 4.0: Visual C++ 4.x on NT 4.0.
+
+Visual C++ 2.0 builds it too. `nmake clean` removes the build output.
 
 ## Run
 
@@ -56,6 +79,8 @@ ntrshd [options]
   -h           help
 ```
 
+Commands run in the folder ntrshd was started in.
+
 **One ntrshd per port.** If another ntrshd already serves the port (in
 another window, or as the service), a new one says so and does not start.
 To run a second one, give it its own port with `-p`.
@@ -72,12 +97,12 @@ ntrshd -remove                      stop and remove
 The **same exe** is both the console program and the service. When the
 Service Control Manager starts it, it detects that and runs as a service;
 when you double-click it, it runs in a console. Installed, it auto-starts on
-boot. As a service it writes a log to `ntrshd.log` next to the exe.
+boot.
 
 `-install` **copies the exe into the system folder** (`%SystemRoot%\System32`)
-and registers *that* copy. So you can install while running it from a mapped
-drive (say `T:`) and the service still starts at boot, when no mapped drive
-exists yet. `-remove` deletes that copy again.
+as `ntrshd.exe` and registers *that* copy. So you can install while running
+it from a mapped drive (say `T:`) and the service still starts at boot, when
+no mapped drive exists yet. `-remove` deletes that copy again.
 
 Start it after installing with `net start ntrshd` (or from Control Panel →
 Services), stop with `net stop ntrshd`. If an ntrshd in a console window
@@ -101,14 +126,37 @@ system error 1056.
   So rsh-mcp's `exec` works on NT as on Unix, with no options, and `-e` is
   not needed for it. Any other command, plain `sh` included, runs as
   before.
-- **Many sessions at once**, each in its own thread and its own hidden
-  process group, so one session cannot disturb another.
-- **All output is delivered** before the connection closes, byte for byte
-  (binary-safe), and the socket closes cleanly (FIN, never a reset).
-- **Client goes away → the command is stopped** (`Ctrl+Break` to its group,
-  then it is terminated if it does not stop).
+- **Each session is on its own.** Each command runs under a small helper:
+  ntrshd itself, started as `ntrshd -session`. So Task Manager shows one
+  more `ntrshd.exe` for each running command. The helper runs `cmd /c` in a
+  hidden console of its own.
+  - Nothing is inherited from ntrshd or from another session: no socket,
+    no pipe. This holds on every NT version, NT 3.1 included.
+  - A `Ctrl+C`, `Ctrl+Break` or closed console in one session reaches no
+    other session, and not ntrshd.
+- **Stopping a command:** the helper sends `Ctrl+Break` to every process in
+  its console, waits 5 seconds, then kills what is left. This happens when:
+  - the client sends a signal on the stderr channel (BSD `rsh` does on
+    `Ctrl+C`);
+  - the client resets the connection, or goes away;
+  - the command prints nothing for longer than `-t`;
+  - ntrshd quits.
+
+  If ntrshd itself is killed, each helper kills its command too.
 - **stdin** is the client's input channel; commands that ignore stdin are
-  unaffected.
+  unaffected. When the client closes its sending side (FIN), that means
+  "no more input", as in BSD `rsh`: the command keeps running. In an
+  rsh-mcp script session the input was the script, so there a FIN means
+  rsh-mcp gave up (its timeout, or a cancel), and the command is stopped.
+- **All output is delivered** before the connection closes, byte for byte
+  (binary-safe). At the end ntrshd sends its FIN at once, so the client sees
+  the end of the output right away, then waits for the client to close too.
+  It never closes with a reset, which could lose output.
+- **Many clients at once.** Each connection gets its own thread at once.
+  NT Workstation (not Server) keeps at most 5 connections waiting to be
+  accepted and refuses more, so a burst of more than 5 connects in the same
+  moment can see a few refused. NT Server takes up to 200. rsh-mcp tries a
+  refused connect again.
 - **At startup** it logs this machine's host name and IP address(es), like
   `ipconfig`, so you can see which address to point clients at.
 - **Status window:** the console shows a live status screen — version, host,
@@ -119,32 +167,17 @@ system error 1056.
   other program holds the port, the status line and the title bar say
   **NOT LISTENING**, and ntrshd tries again every 10 seconds.
 - **Logging:** every event (connect, command, process id, bytes sent, exit
-  code, and how the session ended) is written to `ntrshd.log` next to the exe,
-  in both console and service mode. `-q` replaces the status window with a
-  plain scrolling log in the console.
+  code) is written to `ntrshd.log` next to the exe, in both console and
+  service mode. Each session's `done` line says how it ended: `end of
+  output`, or `stopped:` and why (the client went away, the client sent a
+  signal, no output for too long, rshd is quitting). `-d` adds more detail,
+  such as how the client closed the connection. `-q` replaces the status
+  window with a plain scrolling log in the console.
 - **`Ctrl+C` or `Ctrl+Break` quits.** The first press stops accepting new
   connections and gives the running commands a few seconds to stop; press
   again to kill everything and exit at once (for when something is wedged).
   **Closing the window** quits at once: it kills the running commands and
   tells their clients.
-
-## Capabilities by NT version
-
-Built with its matching SDK for each target:
-
-| Feature | NT 3.1 | NT 3.5 / 3.51 | NT 4.0+ |
-|---|---|---|---|
-| rsh, rcp, service, multi-session, stdin | yes | yes | yes |
-| per-session hidden process group | yes | yes | yes |
-| stop command on client disconnect | yes | yes | yes |
-| sockets made non-inheritable (`SetHandleInformation`) | no¹ | no¹ | **yes** |
-
-¹ NT 3.1 has no `SetHandleInformation`; the NT 3.5 import libraries predate
-it too. On those, a sibling command can briefly inherit a session's socket,
-but the clean `shutdown()` still ends the client's connection at once — the
-socket handle is only freed when the sibling exits. On **NT 4.0 this is fully
-fixed**: no socket is ever inherited. Build NT 4.0 targets (including MIPS,
-Alpha, PowerPC) with the NT 4.0 SDK to get this.
 
 ## Mapped network drives
 
@@ -155,13 +188,34 @@ service runs in its own logon; installed with `-user`, it runs as that
 account, but interactively-mapped drives are not shared into it and must be
 re-established there.
 
-## Status
+## Tested
 
-Builds clean under the NT 3.1, 3.5 and 4.0 SDKs, and passes functional tests
-(rsh, rcp handshake, stderr channel and signal, half-close, empty command,
-rsh-mcp scripts) under Wine.
+Version 1.3, all 11 release exes, each on its own NT version (in LEMU, QEMU
+for these machines):
 
-Validated on a **real NT 4.0 MIPS machine** (RM300, 4-way R4400): single
-commands, 8 simultaneous sessions, ~800-line output delivered complete,
-client-reset stops the running command, and rcp in both directions — all
-pass. The 1000-session handle-leak soak is still a real-NT item to run.
+| CPU | NT 3.1 | NT 3.51 | NT 4.0 |
+|---|---|---|---|
+| x86 | pass | pass | pass |
+| MIPS | pass | pass | pass |
+| Alpha | pass | pass | pass |
+| PowerPC | — | pass | pass |
+
+Each run: a command; the exit status through an rsh-mcp script; `Ctrl+Break`
+from the client; a client reset; 200 KB through stdin, returned exactly; 4
+sessions at once.
+
+More on some of them:
+
+- NT 4.0 Alpha: 2000 sessions, 8 at a time, while one 5-minute command
+  ran. Every session ended with its full output, no connect was refused,
+  and the long command's output came complete. ntrshd's handle count was
+  the same after the first 1000 sessions and after the second.
+- NT 4.0 MIPS: 10.7 MB of output exact, and three such at once.
+- NT 3.1 x86: 8 sessions at once.
+
+NT 3.5 itself was not tested. The `nt35` exes ran on NT 3.51. Every
+function they use is in NT 3.5, and they are marked for NT 3.10.
+
+Earlier versions also ran on a real NT 4.0 MIPS machine (RM300, 4-way
+R4400), and the rsh, rcp, stderr channel and rsh-mcp tests also pass under
+Wine.
