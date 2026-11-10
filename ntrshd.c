@@ -83,7 +83,7 @@
 #define SVCAPI WINAPI
 #endif
 
-#define RSHD_VERSION "1.3.1"
+#define RSHD_VERSION "1.3.2"
 #define RSH_PORT 514
 #define FIELD_SIZE 256
 #define CMD_SIZE 4096
@@ -2382,6 +2382,161 @@ static void SVCAPI serviceMain(DWORD argc, LPTSTR *argv) {
 
 /* -------- install / remove ----------------------------------------------- */
 
+/*
+ * A service that runs as a user account (-install -user) starts only if
+ * that account may log on as a service.  Without that right "net start"
+ * fails with system error 1069.  Control Panel's Services dialog grants it
+ * when you set an account there; -install does the same.
+ *
+ * The right is a flag on the account's LSA account object, set with the
+ * calls NT 3.1's User Manager used (LsaAddAccountRights came only with NT
+ * 3.51).  No SDK header declares them all, so they are declared here and
+ * found with GetProcAddress, which keeps the link the same on every SDK.
+ */
+#define LSA_POLICY_CREATE_ACCOUNT 0x0010L  /* POLICY_CREATE_ACCOUNT */
+#define LSA_POLICY_LOOKUP_NAMES   0x0800L  /* POLICY_LOOKUP_NAMES */
+#define LSA_ACCOUNT_VIEW          0x0001L  /* ACCOUNT_VIEW */
+#define LSA_ACCOUNT_ADJUST_ACCESS 0x0008L  /* ACCOUNT_ADJUST_SYSTEM_ACCESS */
+#define LSA_SERVICE_LOGON         0x0010L  /* POLICY_MODE_SERVICE: log on as a service */
+
+typedef struct {               /* LSA_OBJECT_ATTRIBUTES: all 0 but the length */
+    DWORD length;
+    HANDLE rootDirectory;
+    LPVOID objectName;
+    DWORD attributes;
+    LPVOID securityDescriptor;
+    LPVOID securityQos;
+} LSAATTR;
+
+typedef LONG (WINAPI *LSAOPENPOLICY)(LPVOID system, LSAATTR *attr, ACCESS_MASK access, LPVOID *policy);
+typedef LONG (WINAPI *LSAOPENACCOUNT)(LPVOID policy, PSID sid, ACCESS_MASK access, LPVOID *account);
+typedef LONG (WINAPI *LSAGETACCESS)(LPVOID account, DWORD *flags);
+typedef LONG (WINAPI *LSASETACCESS)(LPVOID account, DWORD flags);
+typedef LONG (WINAPI *LSACLOSE)(LPVOID handle);
+
+/* gives the account the right to log on as a service and says so; returns 0
+   if it could not */
+static int allowServiceLogon(char *user) {
+    HMODULE advapi;
+    LSAOPENPOLICY openPolicy;
+    LSAOPENACCOUNT openAccount;
+    LSAOPENACCOUNT createAccount;
+    LSAGETACCESS getAccess;
+    LSASETACCESS setAccess;
+    LSACLOSE lsaClose;
+    LSAATTR attr;
+    LPVOID policy;
+    LPVOID account;
+    SID_NAME_USE use;
+    DWORD sid[64];             /* DWORDs: a SID must be aligned */
+    char domain[256];
+    char computer[64];
+    char name[512];
+    char *acct;
+    DWORD sidSize;
+    DWORD domainSize;
+    DWORD size;
+    DWORD flags;
+    LONG status;
+    int ok;
+
+    /* the SCM writes an account on this computer as ".\user"; LookupAccountName
+       wants the computer's name there */
+    acct = user;
+    computer[0] = 0;
+    if (user[0] == '.' && user[1] == '\\') {
+        acct = user + 2;
+        size = sizeof(computer);
+        if (!GetComputerName(computer, &size)) {
+            computer[0] = 0;
+        }
+        computer[sizeof(computer) - 1] = 0;
+    }
+    if (lstrcmpi(acct, "LocalSystem") == 0) {
+        return 1;              /* the SCM's own name for LocalSystem: no right needed */
+    }
+    if (strlen(computer) + strlen(acct) + 2 > sizeof(name)) {
+        printf("  the account name is too long\n");
+        return 0;
+    }
+    if (computer[0] != 0) {
+        sprintf(name, "%s\\%s", computer, acct);
+    } else {
+        strcpy(name, acct);
+    }
+    sidSize = sizeof(sid);
+    domainSize = sizeof(domain);
+    if (!LookupAccountName(NULL, name, (PSID)sid, &sidSize, domain, &domainSize, &use)) {
+        printf("  cannot find the account %s, error %lu\n", name, GetLastError());
+        return 0;
+    }
+
+    advapi = GetModuleHandle("ADVAPI32.DLL");
+    if (advapi == NULL) {
+        printf("  cannot find ADVAPI32.DLL, error %lu\n", GetLastError());
+        return 0;
+    }
+    openPolicy = (LSAOPENPOLICY)GetProcAddress(advapi, "LsaOpenPolicy");
+    openAccount = (LSAOPENACCOUNT)GetProcAddress(advapi, "LsaOpenAccount");
+    createAccount = (LSAOPENACCOUNT)GetProcAddress(advapi, "LsaCreateAccount");
+    getAccess = (LSAGETACCESS)GetProcAddress(advapi, "LsaGetSystemAccessAccount");
+    setAccess = (LSASETACCESS)GetProcAddress(advapi, "LsaSetSystemAccessAccount");
+    lsaClose = (LSACLOSE)GetProcAddress(advapi, "LsaClose");
+    if (openPolicy == NULL || openAccount == NULL || createAccount == NULL ||
+        getAccess == NULL || setAccess == NULL || lsaClose == NULL) {
+        printf("  this NT has no LSA account calls\n");
+        return 0;
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.length = sizeof(attr);
+    status = openPolicy(NULL, &attr, LSA_POLICY_CREATE_ACCOUNT | LSA_POLICY_LOOKUP_NAMES, &policy);
+    if (status != 0) {
+        printf("  LsaOpenPolicy failed, status 0x%08lX\n", (unsigned long)status);
+        return 0;
+    }
+    /* an account with no rights or privileges yet has no LSA account object */
+    status = openAccount(policy, (PSID)sid, LSA_ACCOUNT_VIEW | LSA_ACCOUNT_ADJUST_ACCESS, &account);
+    if (status != 0) {
+        status = createAccount(policy, (PSID)sid, LSA_ACCOUNT_VIEW | LSA_ACCOUNT_ADJUST_ACCESS, &account);
+    }
+    if (status != 0) {
+        printf("  LsaCreateAccount failed, status 0x%08lX\n", (unsigned long)status);
+        lsaClose(policy);
+        return 0;
+    }
+    ok = 0;
+    status = getAccess(account, &flags);
+    if (status != 0) {
+        printf("  LsaGetSystemAccessAccount failed, status 0x%08lX\n", (unsigned long)status);
+    } else if (flags & LSA_SERVICE_LOGON) {
+        printf("  %s may log on as a service\n", user);
+        ok = 1;
+    } else {
+        status = setAccess(account, flags | LSA_SERVICE_LOGON);
+        if (status != 0) {
+            printf("  LsaSetSystemAccessAccount failed, status 0x%08lX\n", (unsigned long)status);
+        } else {
+            printf("  %s was given the right to log on as a service\n", user);
+            ok = 1;
+        }
+    }
+    lsaClose(account);
+    lsaClose(policy);
+    return ok;
+}
+
+/* clears the read-only flag: CopyFile keeps it (of an exe run from a CD, say),
+   and a read-only file can be neither replaced nor deleted */
+static void makeWritable(char *path) {
+    DWORD attrs;
+
+    attrs = GetFileAttributes(path);
+    if (attrs != NO_ATTRS && (attrs & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributes(path, FILE_ATTRIBUTE_NORMAL);
+    }
+}
+
 static void doInstall(char *user, char *password, char *extra) {
     SC_HANDLE scm;
     SC_HANDLE svc;
@@ -2404,10 +2559,12 @@ static void doInstall(char *user, char *password, char *extra) {
        interactive logon), so install from a local path: copy the exe into the
        system directory and register that copy, not wherever we were run from. */
     if (lstrcmpi(myPath, binPath) != 0) {
+        makeWritable(binPath);          /* an old copy may be read-only */
         if (!CopyFile(myPath, binPath, FALSE)) {
             printf("cannot copy exe to %s, error %lu\n", binPath, GetLastError());
             return;
         }
+        makeWritable(binPath);
         printf("copied exe to %s\n", binPath);
     }
     /* NT 3.1's service controller cannot start a quoted path ("net start"
@@ -2434,6 +2591,11 @@ static void doInstall(char *user, char *password, char *extra) {
     printf("  binary: %s\n", image);
     if (user != NULL) {
         printf("  account: %s\n", user);
+        if (!allowServiceLogon(user)) {
+            printf("  could not give %s the right to log on as a service.\n", user);
+            printf("  Give it in User Manager: Policies, User Rights, Show Advanced User\n");
+            printf("  Rights, Log on as a service.  Without it net start fails with error 1069.\n");
+        }
     } else {
         printf("  account: LocalSystem (no access to mapped network drives)\n");
     }
@@ -2481,6 +2643,7 @@ static void doRemove(void) {
        it may be the very exe running this -remove, which cannot delete itself) */
     if (GetSystemDirectory(sysDir, sizeof(sysDir)) != 0) {
         sprintf(binPath, "%s\\%s.exe", sysDir, SVC_NAME);
+        makeWritable(binPath);
         if (DeleteFile(binPath)) {
             printf("deleted %s\n", binPath);
         } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {

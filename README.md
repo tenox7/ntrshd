@@ -104,6 +104,10 @@ as `ntrshd.exe` and registers *that* copy. So you can install while running
 it from a mapped drive (say `T:`) and the service still starts at boot, when
 no mapped drive exists yet. `-remove` deletes that copy again.
 
+With `-user`, `-install` also gives that account the right to **log on as
+a service**, as Control Panel → Services does when you set an account
+there. Without that right, `net start` fails with system error 1069.
+
 Start it after installing with `net start ntrshd` (or from Control Panel →
 Services), stop with `net stop ntrshd`. If an ntrshd in a console window
 already serves the port, the service does not start: `net start` reports
@@ -190,9 +194,8 @@ re-established there.
 
 ## Tested
 
-Version 1.3.1, all 11 release exes, each on its own NT version (in LEMU, QEMU
-for these machines). Each one was installed as a service with
-`ntrshd -install`, started with `net start ntrshd`, and tested there:
+Version 1.3.2, all 11 release exes, each on its own NT version (in LEMU, QEMU
+for these machines):
 
 | CPU | NT 3.1 | NT 3.51 | NT 4.0 |
 |---|---|---|---|
@@ -201,10 +204,23 @@ for these machines). Each one was installed as a service with
 | Alpha | pass | pass | pass |
 | PowerPC | — | pass | pass |
 
-Each run: a command; the exit status through an rsh-mcp script; `Ctrl+Break`
-from the client; a client reset; 200 KB through stdin, returned exactly; 4
-sessions at once. On NT 3.1 MIPS and Alpha, also installed with an option
-(`ntrshd -install -p 2514`).
+Each one was installed as a service with `ntrshd -install -user .\rshtest
+-pass ...`, for a new account that did not have the right to log on as a
+service yet. `-install` gave it the right, and `net start ntrshd` started the
+service as that account. 1.3.1 got system error 1069 there (checked on NT 3.1
+and NT 4.0 x86). `-install` as `.\Administrator`, which had the right already,
+and as LocalSystem worked too.
+
+Then each service ran: a command; the exit status through an rsh-mcp script;
+`Ctrl+Break` from the client; a client reset; 4 sessions at once.
+
+1.3.2 also runs as the boot service, as `.\Administrator`, on 15 NT machines
+in LEMU: one for each of the 11 above, plus NT 3.51 and NT 4.0 on an SNI
+RM200, and NT 4.0 on an RM300 with 2 and with 4 CPUs.
+
+Version 1.3.1, the same code apart from `-install`, also passed 200 KB through
+stdin, returned exactly. On NT 3.1 MIPS and Alpha it was also installed with
+an option (`ntrshd -install -p 2514`).
 
 Version 1.3, the same code apart from `-install`, also ran these, in a
 console window:
